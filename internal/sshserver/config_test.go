@@ -6,6 +6,7 @@ Distributed under the terms of the MIT license
 package sshserver
 
 import (
+	"os/user"
 	"path/filepath"
 	"testing"
 	"time"
@@ -85,11 +86,27 @@ func TestLoadConfigIgnoresUnparseableValues(t *testing.T) {
 	}
 }
 
-func TestDefaultHostKeyPathWithoutHome(t *testing.T) {
+func TestDefaultHostKeyPathPrefersHomeEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	want := filepath.Join(home, hostKeyDirName, hostKeyFileName)
+	if got := defaultHostKeyPath(); got != want {
+		t.Errorf("expected %s, got %s", want, got)
+	}
+}
+
+func TestDefaultHostKeyPathFallsBackToPasswdEntry(t *testing.T) {
 	t.Setenv("HOME", "")
 
-	if path := defaultHostKeyPath(); path != "" {
-		t.Errorf("expected empty path when home is unset, got %s", path)
+	current, err := user.Current()
+	if err != nil || current.HomeDir == "" {
+		t.Skip("no passwd home directory available")
+	}
+
+	want := filepath.Join(current.HomeDir, hostKeyDirName, hostKeyFileName)
+	if got := defaultHostKeyPath(); got != want {
+		t.Errorf("expected fallback to the passwd home %s, got %s", want, got)
 	}
 }
 

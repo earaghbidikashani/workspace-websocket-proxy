@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -57,11 +58,21 @@ func LoadConfig() *Config {
 }
 
 func defaultHostKeyPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := homeDir()
+	if home == "" {
 		return ""
 	}
 	return filepath.Join(home, hostKeyDirName, hostKeyFileName)
+}
+
+func homeDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return home
+	}
+	if current, err := user.Current(); err == nil {
+		return current.HomeDir
+	}
+	return ""
 }
 
 func (c *Config) validate() error {

@@ -34,7 +34,7 @@ type Config struct {
 	PingTimeout time.Duration
 
 	// MaxConnections is the maximum number of concurrent WebSocket connections.
-	// New connections are rejected with 503 when at capacity.
+	// New connections are rejected with 429 when at capacity.
 	MaxConnections int
 
 	// ReadLimit is the maximum size in bytes of incoming WebSocket messages.

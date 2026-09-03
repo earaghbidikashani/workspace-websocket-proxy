@@ -26,8 +26,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if config.IdleTimeout != 0 {
 		t.Errorf("expected 0, got %s", config.IdleTimeout)
 	}
-	if config.MaxSessions != DefaultMaxSessions {
-		t.Errorf("expected %d, got %d", DefaultMaxSessions, config.MaxSessions)
+	if config.MaxSessions != defaultMaxSessions {
+		t.Errorf("expected %d, got %d", defaultMaxSessions, config.MaxSessions)
 	}
 	if config.LoginShell {
 		t.Error("expected LoginShell to default to false")
@@ -77,8 +77,8 @@ func TestLoadConfigIgnoresUnparseableValues(t *testing.T) {
 	if config.IdleTimeout != 0 {
 		t.Errorf("expected fallback 0, got %s", config.IdleTimeout)
 	}
-	if config.MaxSessions != DefaultMaxSessions {
-		t.Errorf("expected fallback %d, got %d", DefaultMaxSessions, config.MaxSessions)
+	if config.MaxSessions != defaultMaxSessions {
+		t.Errorf("expected fallback %d, got %d", defaultMaxSessions, config.MaxSessions)
 	}
 	if config.LoginShell {
 		t.Error("expected fallback false")
@@ -88,7 +88,7 @@ func TestLoadConfigIgnoresUnparseableValues(t *testing.T) {
 func TestDefaultHostKeyPathWithoutHome(t *testing.T) {
 	t.Setenv("HOME", "")
 
-	if path := DefaultHostKeyPath(); path != "" {
+	if path := defaultHostKeyPath(); path != "" {
 		t.Errorf("expected empty path when home is unset, got %s", path)
 	}
 }
@@ -192,7 +192,7 @@ func TestValidate(t *testing.T) {
 			config := validConfig()
 			tc.mutate(config)
 
-			err := config.Validate()
+			err := config.validate()
 			if tc.wantErr && err == nil {
 				t.Fatal("expected an error, got nil")
 			}
@@ -245,8 +245,8 @@ func TestHasEphemeralHostKeyPath(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
 			config := &Config{HostKeyPath: tc.path}
-			if got := config.HasEphemeralHostKeyPath(); got != tc.want {
-				t.Errorf("HasEphemeralHostKeyPath(%q) = %v, want %v", tc.path, got, tc.want)
+			if got := config.hasEphemeralHostKeyPath(); got != tc.want {
+				t.Errorf("hasEphemeralHostKeyPath(%q) = %v, want %v", tc.path, got, tc.want)
 			}
 		})
 	}

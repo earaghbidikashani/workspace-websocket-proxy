@@ -16,84 +16,47 @@ import (
 )
 
 const (
-	// DefaultPort is the loopback port the SSH server listens on. It must match the
-	// target port the WebSocket proxy bridges to.
-	DefaultPort = 2222
+	defaultPort = 2222
 
-	// DefaultMaxSessions caps concurrent SSH sessions. Each session spawns a shell,
-	// so an unbounded count risks exhausting the workspace container's memory.
-	DefaultMaxSessions = 10
+	defaultMaxSessions = 10
 
-	// hostKeyDirName holds the persisted host key, relative to the user's home
-	// directory. Home is backed by the workspace's storage volume, so a key written
-	// there survives pod recreation rather than only container restart.
 	hostKeyDirName = ".jupyter-k8s"
 
-	// hostKeyFileName is the file name of the persisted ed25519 host key.
 	hostKeyFileName = "ssh_host_ed25519_key"
 
-	// localhostHost is the hostname form of a loopback address.
 	localhostHost = "localhost"
 )
 
-// ephemeralPathPrefixes are locations that live on the container's writable layer
-// rather than on a mounted volume. A host key stored there is regenerated on every
-// container restart, which makes every client report a changed host key.
 var ephemeralPathPrefixes = []string{"/tmp/", "/var/tmp/", "/run/", "/dev/shm/"}
 
-// Config holds all configuration for the SSH server.
+// Config holds the SSH server configuration.
 type Config struct {
-	// ListenAddr is the address the SSH server listens on. It must resolve to a
-	// loopback address unless AllowNonLoopback is set.
 	ListenAddr string
 
-	// HostKeyPath is where the ed25519 host key is persisted, generated on first
-	// use. The path must survive container restarts: a new host key on every start
-	// makes clients refuse to reconnect until their known_hosts entry is cleared.
 	HostKeyPath string
 
-	// IdleTimeout closes a session that has seen no traffic for this long. Zero
-	// disables it.
 	IdleTimeout time.Duration
 
-	// MaxSessions caps concurrent SSH sessions. Zero disables the cap.
 	MaxSessions int
 
-	// LoginShell runs the session shell as a login shell. Images that put their
-	// interpreter on PATH through a shell profile rather than through the image
-	// environment require this; images that set PATH in the environment do not.
 	LoginShell bool
 
-	// AllowNonLoopback permits binding a non-loopback address.
-	//
-	// This server performs no SSH authentication. It is designed to sit behind an
-	// authenticating reverse proxy: the workspace ingress validates a short-lived
-	// JWT before any byte reaches the tunnel, and the only transport-level
-	// protection is that the socket is unreachable from outside the pod. Binding a
-	// routable address therefore publishes an unauthenticated shell, so Validate
-	// refuses to do so unless this is explicitly set.
 	AllowNonLoopback bool
 }
 
-// LoadConfig reads configuration from environment variables with sensible
-// defaults. It does not validate: callers override fields from flags before
-// handing the result to New, which validates.
+// LoadConfig reads the SSH server configuration from the environment.
 func LoadConfig() *Config {
 	return &Config{
-		ListenAddr:       getEnv("SSH_LISTEN_ADDR", fmt.Sprintf("127.0.0.1:%d", DefaultPort)),
-		HostKeyPath:      getEnv("SSH_HOST_KEY_PATH", DefaultHostKeyPath()),
+		ListenAddr:       getEnv("SSH_LISTEN_ADDR", fmt.Sprintf("127.0.0.1:%d", defaultPort)),
+		HostKeyPath:      getEnv("SSH_HOST_KEY_PATH", defaultHostKeyPath()),
 		IdleTimeout:      getDurationEnv("SSH_IDLE_TIMEOUT", 0),
-		MaxSessions:      getIntEnv("SSH_MAX_SESSIONS", DefaultMaxSessions),
+		MaxSessions:      getIntEnv("SSH_MAX_SESSIONS", defaultMaxSessions),
 		LoginShell:       getBoolEnv("SSH_LOGIN_SHELL", false),
 		AllowNonLoopback: getBoolEnv("SSH_ALLOW_NON_LOOPBACK", false),
 	}
 }
 
-// DefaultHostKeyPath returns the host key location under the user's home
-// directory. It returns an empty string when the home directory cannot be
-// determined, which Validate rejects so the operator is told to set
-// SSH_HOST_KEY_PATH rather than silently getting an ephemeral key.
-func DefaultHostKeyPath() string {
+func defaultHostKeyPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return ""
@@ -101,9 +64,7 @@ func DefaultHostKeyPath() string {
 	return filepath.Join(home, hostKeyDirName, hostKeyFileName)
 }
 
-// Validate rejects a configuration that would expose an unauthenticated shell or
-// that cannot persist a host key.
-func (c *Config) Validate() error {
+func (c *Config) validate() error {
 	host, port, err := net.SplitHostPort(c.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("SSH_LISTEN_ADDR must be host:port, got %q: %w", c.ListenAddr, err)
@@ -142,9 +103,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// HasEphemeralHostKeyPath reports whether the host key would be written to the
-// container's writable layer, where it is lost on restart.
-func (c *Config) HasEphemeralHostKeyPath() bool {
+func (c *Config) hasEphemeralHostKeyPath() bool {
 	for _, prefix := range ephemeralPathPrefixes {
 		if strings.HasPrefix(c.HostKeyPath, prefix) {
 			return true
@@ -153,8 +112,6 @@ func (c *Config) HasEphemeralHostKeyPath() bool {
 	return false
 }
 
-// isLoopback reports whether host is a loopback address. An empty host, or a
-// wildcard, binds every interface and is therefore not loopback.
 func isLoopback(host string) bool {
 	if host == "" || host == "*" {
 		return false

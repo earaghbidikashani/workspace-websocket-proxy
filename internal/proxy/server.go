@@ -18,21 +18,9 @@ import (
 )
 
 const (
-	// healthPath reports on the proxy process only. It deliberately does not dial
-	// the target, so it stays suitable for a pod-wide readiness probe: pod
-	// readiness gates every port on the pod, and failing it because remote access
-	// is broken would also withdraw the application port from the Service.
-	healthPath = "/health"
-
-	// targetHealthPath reports whether the proxy can reach the target. Use it for
-	// alerting and for probes scoped to remote access, not for pod readiness.
-	targetHealthPath = "/health/target"
-
-	// metricsPath serves the Prometheus registry.
-	metricsPath = "/metrics"
-
-	// targetHealthDialTimeout bounds the probe dial so a wedged target cannot hold
-	// the handler open.
+	healthPath              = "/health"
+	targetHealthPath        = "/health/target"
+	metricsPath             = "/metrics"
 	targetHealthDialTimeout = 2 * time.Second
 )
 
@@ -95,9 +83,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":"ok","activeConnections":%d}`, s.sessionManager.ActiveCount())
 }
 
-// handleTargetHealth dials the target and reports whether it accepted the
-// connection. It also records the outcome as a gauge so the same signal is
-// available to Prometheus without polling this endpoint.
 func (s *Server) handleTargetHealth(w http.ResponseWriter, r *http.Request) {
 	target := s.config.TargetAddr()
 

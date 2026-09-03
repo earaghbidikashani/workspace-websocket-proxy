@@ -25,9 +25,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// subcommandSSH selects the SSH server mode, which runs in the workspace
-// container and terminates remote IDE sessions on loopback. The default mode is
-// the WebSocket proxy that bridges traffic to it.
 const subcommandSSH = "ssh"
 
 func main() {
@@ -104,9 +101,6 @@ func main() {
 	logger.Info("Server stopped")
 }
 
-// runSSHServer starts the SSH server that terminates remote IDE sessions.
-// Flags override the environment so the same binary is usable by hand and from a
-// supervisor config.
 func runSSHServer(args []string) {
 	zapLog, err := zap.NewProduction()
 	if err != nil {
@@ -167,9 +161,6 @@ func runSSHServer(args []string) {
 	logger.Info("SSH server stopped")
 }
 
-// isFlagSet reports whether the named flag was supplied on the command line,
-// letting an explicit boolean flag override the environment while an omitted one
-// leaves the environment value in place.
 func isFlagSet(fs *flag.FlagSet, name string) bool {
 	found := false
 	fs.Visit(func(f *flag.Flag) {

@@ -3,10 +3,6 @@ Copyright (c) Amazon Web Services
 Distributed under the terms of the MIT license
 */
 
-// Package sshserver_test exercises the SSH server through the WebSocket proxy,
-// which is the path a desktop IDE takes. It uses no cluster and no external
-// binaries: the WebSocket connection is adapted to a net.Conn and handed to an
-// SSH client directly, the same way a ProxyCommand would.
 package sshserver_test
 
 import (
@@ -42,7 +38,6 @@ func testLogger() logr.Logger {
 	return zapr.NewLogger(zapLog)
 }
 
-// freeLoopbackPort reserves and releases a loopback port so a server can bind it.
 func freeLoopbackPort(t *testing.T) int {
 	t.Helper()
 
@@ -55,7 +50,6 @@ func freeLoopbackPort(t *testing.T) int {
 	return listener.Addr().(*net.TCPAddr).Port
 }
 
-// waitForListener blocks until addr accepts a connection.
 func waitForListener(t *testing.T, addr string) {
 	t.Helper()
 
@@ -71,7 +65,6 @@ func waitForListener(t *testing.T, addr string) {
 	t.Fatalf("nothing listening on %s after %s", addr, startupTimeout)
 }
 
-// startSSHServer runs the SSH server on a free loopback port and returns its address.
 func startSSHServer(t *testing.T) string {
 	t.Helper()
 
@@ -94,7 +87,6 @@ func startSSHServer(t *testing.T) string {
 	return config.ListenAddr
 }
 
-// startProxy runs the WebSocket proxy in front of target and returns its address.
 func startProxy(t *testing.T, target string) string {
 	t.Helper()
 
@@ -131,8 +123,6 @@ func startProxy(t *testing.T, target string) string {
 	return config.ListenAddr
 }
 
-// wsConn adapts a WebSocket connection to net.Conn so an SSH client can use it as
-// its transport. Only binary frames carry payload, matching what the proxy bridges.
 type wsConn struct {
 	ws      *websocket.Conn
 	pending io.Reader
@@ -185,8 +175,6 @@ func (c *wsConn) SetDeadline(t time.Time) error {
 	return c.SetWriteDeadline(t)
 }
 
-// dialSSHThroughProxy opens an SSH client whose transport is a WebSocket
-// connection to the proxy.
 func dialSSHThroughProxy(t *testing.T, proxyAddr string) *gossh.Client {
 	t.Helper()
 
@@ -361,8 +349,6 @@ func TestLocalPortForwardReachesLoopbackService(t *testing.T) {
 	}
 }
 
-// readFullWithin reads exactly n bytes, bounding the wait. SSH channels do not
-// support read deadlines, so the timeout is enforced by the caller.
 func readFullWithin(reader io.Reader, n int, timeout time.Duration) ([]byte, error) {
 	type result struct {
 		buf []byte
@@ -407,7 +393,6 @@ func TestProxyTargetHealthReflectsSSHServer(t *testing.T) {
 	}
 }
 
-// newEchoBackend starts a loopback TCP echo server and returns its address.
 func newEchoBackend(t *testing.T) string {
 	t.Helper()
 

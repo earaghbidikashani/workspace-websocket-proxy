@@ -3,21 +3,6 @@ Copyright (c) Amazon Web Services
 Distributed under the terms of the MIT license
 */
 
-// Package sshserver provides the SSH server that terminates remote IDE sessions
-// inside the workspace container.
-//
-// Two properties are load-bearing and easy to "fix" wrongly.
-//
-// The server runs in the workspace container, not a sidecar. An SSH server spawns
-// the login shell as its own child process, so the shell inherits the server's
-// mount namespace. Running it anywhere else gives the user a shell with none of
-// their files, interpreter, or kernels.
-//
-// The server performs no SSH authentication and listens on loopback only.
-// Authentication happens at the ingress, which validates a short-lived JWT before
-// any byte reaches the tunnel; loopback binding is what keeps the socket
-// unreachable from outside the pod. Config.Validate refuses a non-loopback bind
-// for this reason.
 package sshserver
 
 import (
@@ -45,30 +30,20 @@ import (
 )
 
 const (
-	// exitCodeGeneralError is reported when the server itself fails to run the
-	// requested command.
 	exitCodeGeneralError = 1
 
-	// exitCodeCommandNotExecutable mirrors the shell convention for a command that
-	// could not be started.
 	exitCodeCommandNotExecutable = 127
 
-	// signalExitCodeBase mirrors the shell convention of reporting a signalled
-	// child as 128 plus the signal number.
 	signalExitCodeBase = 128
 
-	// hostKeyDirMode and hostKeyFileMode keep the private key readable only by its
-	// owner.
 	hostKeyDirMode  = 0o700
 	hostKeyFileMode = 0o600
 
-	// shellBash and shellSh are the fallback shells, tried in order when SHELL is
-	// unset or names a path that does not exist.
 	shellBash = "/bin/bash"
 	shellSh   = "/bin/sh"
 )
 
-// Server wraps a gliderlabs SSH server with the handlers a desktop IDE needs.
+// Server is the SSH server that terminates remote IDE sessions.
 type Server struct {
 	config   *Config
 	logger   logr.Logger
@@ -76,10 +51,9 @@ type Server struct {
 	sessions atomic.Int64
 }
 
-// New validates the configuration, loads or generates the host key, and builds
-// the SSH server.
+// New validates the configuration and builds the SSH server.
 func New(config *Config, logger logr.Logger) (*Server, error) {
-	if err := config.Validate(); err != nil {
+	if err := config.validate(); err != nil {
 		return nil, err
 	}
 
@@ -93,7 +67,7 @@ func New(config *Config, logger logr.Logger) (*Server, error) {
 		"generated", generated,
 		"fingerprint", gossh.FingerprintSHA256(signer.PublicKey()))
 
-	if config.HasEphemeralHostKeyPath() {
+	if config.hasEphemeralHostKeyPath() {
 		logger.Info("Host key path is on ephemeral storage and will not survive a container restart",
 			"path", config.HostKeyPath)
 	}
@@ -141,10 +115,6 @@ func (s *Server) Shutdown(_ context.Context) error {
 	return s.ssh.Close()
 }
 
-// allowLocalForward permits forwarding only to loopback destinations inside the
-// pod. An IDE uses this to reach services in the workspace, such as the Jupyter
-// port or a dev server; the pod's network namespace is the intended blast radius,
-// not the cluster network.
 func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool {
 	if !isLoopback(host) {
 		s.logger.Info("Rejected local forward to non-loopback destination", "host", host, "port", port)
@@ -154,10 +124,6 @@ func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool
 	return true
 }
 
-// allowReverseForward permits remote forwarding only onto loopback bind
-// addresses. gliderlabs rejects every reverse forward when this callback is
-// absent, so it must be set for remote port forwarding to work at all; binding a
-// routable address would expose the forwarded port to the cluster network.
 func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort uint32) bool {
 	if bindHost == "" {
 		s.logger.V(1).Info("Accepted reverse forward on implicit loopback bind", "port", bindPort)
@@ -172,7 +138,6 @@ func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort ui
 	return true
 }
 
-// handleSession runs a command or an interactive shell for the session.
 func (s *Server) handleSession(session ssh.Session) {
 	if !s.acquireSession() {
 		s.logger.Info("Rejecting session: at capacity", "maxSessions", s.config.MaxSessions)
@@ -201,8 +166,6 @@ func (s *Server) handleSession(session ssh.Session) {
 	s.runWithoutPty(session, cmd, logger)
 }
 
-// acquireSession reserves a session slot, reporting false when the server is at
-// capacity. A zero MaxSessions disables the cap.
 func (s *Server) acquireSession() bool {
 	if s.config.MaxSessions <= 0 {
 		return true
@@ -214,7 +177,6 @@ func (s *Server) acquireSession() bool {
 	return true
 }
 
-// releaseSession returns a session slot reserved by acquireSession.
 func (s *Server) releaseSession() {
 	if s.config.MaxSessions <= 0 {
 		return
@@ -222,8 +184,6 @@ func (s *Server) releaseSession() {
 	s.sessions.Add(-1)
 }
 
-// runWithPty attaches the command to a pseudo-terminal, which is what an
-// interactive IDE terminal needs.
 func (s *Server) runWithPty(
 	session ssh.Session,
 	cmd *exec.Cmd,
@@ -257,10 +217,6 @@ func (s *Server) runWithPty(
 	s.finish(session, cmd, logger)
 }
 
-// watchWindowSize propagates client resize events to the pty until the returned
-// stop channel is closed. The caller must wait on the returned done channel
-// before closing the pty: resizing reads the raw file descriptor, which is
-// invalid once the file is closed.
 func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan struct{}, done chan struct{}) {
 	stop = make(chan struct{})
 	done = make(chan struct{})
@@ -283,8 +239,6 @@ func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan
 	return stop, done
 }
 
-// runWithoutPty wires stdio directly. Remote-SSH uses this path for its bootstrap
-// commands, so the exit status has to be faithful.
 func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
 	cmd.Stdout = session
 	cmd.Stderr = session.Stderr()
@@ -311,17 +265,12 @@ func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.L
 	s.finish(session, cmd, logger)
 }
 
-// finish waits for the child and propagates its real exit status. Remote-SSH
-// branches on these codes during bootstrap, so swallowing them breaks the
-// connection in ways that are hard to diagnose from the client side.
 func (s *Server) finish(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
 	code := exitCode(cmd.Wait())
 	logger.Info("Session closed", "exitCode", code)
 	_ = session.Exit(code)
 }
 
-// exitCode maps the result of exec.Cmd.Wait to an SSH exit status, reporting a
-// signalled child as 128 plus the signal number.
 func exitCode(err error) int {
 	if err == nil {
 		return 0
@@ -342,8 +291,6 @@ func exitCode(err error) int {
 	return exitCodeGeneralError
 }
 
-// handleSFTP serves the sftp subsystem, which IDEs use to transfer files and to
-// install their remote server component.
 func (s *Server) handleSFTP(session ssh.Session) {
 	logger := s.logger.WithValues("remoteAddr", session.RemoteAddr().String())
 	logger.Info("SFTP session opened")
@@ -366,9 +313,6 @@ func (s *Server) handleSFTP(session ssh.Session) {
 	_ = session.Exit(0)
 }
 
-// buildShellCommand assembles the child process for a session. A non-empty
-// rawCmd runs through the shell so that quoting and redirection behave as a
-// client expects.
 func buildShellCommand(shell string, loginShell bool, rawCmd string) *exec.Cmd {
 	if strings.TrimSpace(rawCmd) == "" {
 		if loginShell {
@@ -383,9 +327,6 @@ func buildShellCommand(shell string, loginShell bool, rawCmd string) *exec.Cmd {
 	return exec.Command(shell, "-c", rawCmd)
 }
 
-// resolveShell picks the user's shell, preferring SHELL and falling back to
-// whatever exists. A missing shell would otherwise fail every session with an
-// opaque error.
 func resolveShell() string {
 	candidates := []string{os.Getenv("SHELL"), shellBash, shellSh}
 	for _, candidate := range candidates {
@@ -399,8 +340,6 @@ func resolveShell() string {
 	return shellSh
 }
 
-// mergeEnv overlays the client-supplied environment on the process environment.
-// The client's values win, matching sshd with AcceptEnv.
 func mergeEnv(sessionEnv []string) []string {
 	merged := map[string]string{}
 	for _, entry := range append(os.Environ(), sessionEnv...) {
@@ -416,7 +355,6 @@ func mergeEnv(sessionEnv []string) []string {
 	return out
 }
 
-// lookupEnv returns the value of key in an environment slice.
 func lookupEnv(env []string, key string) (string, bool) {
 	prefix := key + "="
 	for _, entry := range env {
@@ -427,9 +365,6 @@ func lookupEnv(env []string, key string) (string, bool) {
 	return "", false
 }
 
-// loadOrCreateHostKey returns the persisted host key, generating one on first
-// use. Reusing a key across restarts is what stops clients from reporting a
-// changed host key every time the process comes back.
 func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err error) {
 	pemBytes, readErr := os.ReadFile(path)
 	switch {
@@ -462,7 +397,6 @@ func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err er
 	return parsed, true, nil
 }
 
-// generateHostKeyPEM creates a new ed25519 private key in PKCS#8 PEM form.
 func generateHostKeyPEM() ([]byte, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -477,7 +411,6 @@ func generateHostKeyPEM() ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
-// setWinsize propagates terminal resize events to the pty.
 func setWinsize(f *os.File, w, h int) {
 	winsize := struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0}
 	_, _, _ = syscall.Syscall(

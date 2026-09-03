@@ -122,3 +122,4 @@ jobs:
           tag_name: ${{ inputs.version }}
           name: "workspace-websocket-proxy ${{ inputs.version }}"
           generate_release_notes: true
+          prerelease: ${{ contains(inputs.version, '-') }}

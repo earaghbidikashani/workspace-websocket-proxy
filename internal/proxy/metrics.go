@@ -16,6 +16,7 @@ type Metrics struct {
 	ConnectionErrors   *prometheus.CounterVec
 	BytesTransferred   *prometheus.CounterVec
 	ConnectionDuration prometheus.Histogram
+	TargetReachable    prometheus.Gauge
 	Registry           *prometheus.Registry
 }
 
@@ -55,7 +56,19 @@ func NewMetrics() *Metrics {
 		Buckets: []float64{1, 10, 60, 300, 600, 1800, 3600, 7200, 14400, 28800, 43200},
 	})
 
-	registry.MustRegister(connectionsTotal, activeConnections, connectionErrors, bytesTransferred, connectionDuration)
+	targetReachable := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ws_proxy_target_reachable",
+		Help: "Whether the last target health check succeeded (1) or failed (0)",
+	})
+
+	registry.MustRegister(
+		connectionsTotal,
+		activeConnections,
+		connectionErrors,
+		bytesTransferred,
+		connectionDuration,
+		targetReachable,
+	)
 
 	return &Metrics{
 		ConnectionsTotal:   connectionsTotal,
@@ -63,6 +76,7 @@ func NewMetrics() *Metrics {
 		ConnectionErrors:   connectionErrors,
 		BytesTransferred:   bytesTransferred,
 		ConnectionDuration: connectionDuration,
+		TargetReachable:    targetReachable,
 		Registry:           registry,
 	}
 }

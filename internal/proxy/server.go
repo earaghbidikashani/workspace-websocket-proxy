@@ -17,6 +17,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const (
+	// healthPath reports on the proxy process only. It deliberately does not dial
+	// the target, so it stays suitable for a pod-wide readiness probe: pod
+	// readiness gates every port on the pod, and failing it because remote access
+	// is broken would also withdraw the application port from the Service.
+	healthPath = "/health"
+
+	// targetHealthPath reports whether the proxy can reach the target. Use it for
+	// alerting and for probes scoped to remote access, not for pod readiness.
+	targetHealthPath = "/health/target"
+
+	// metricsPath serves the Prometheus registry.
+	metricsPath = "/metrics"
+
+	// targetHealthDialTimeout bounds the probe dial so a wedged target cannot hold
+	// the handler open.
+	targetHealthDialTimeout = 2 * time.Second
+)
+
 // Server is the main WebSocket proxy HTTP server.
 type Server struct {
 	config         *Config
@@ -38,8 +57,9 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.Handle("/metrics", promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc(healthPath, s.handleHealth)
+	mux.HandleFunc(targetHealthPath, s.handleTargetHealth)
+	mux.Handle(metricsPath, promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/", s.handleWebSocket)
 
 	s.httpServer = &http.Server{
@@ -75,6 +95,34 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":"ok","activeConnections":%d}`, s.sessionManager.ActiveCount())
 }
 
+// handleTargetHealth dials the target and reports whether it accepted the
+// connection. It also records the outcome as a gauge so the same signal is
+// available to Prometheus without polling this endpoint.
+func (s *Server) handleTargetHealth(w http.ResponseWriter, r *http.Request) {
+	target := s.config.TargetAddr()
+
+	ctx, cancel := context.WithTimeout(r.Context(), targetHealthDialTimeout)
+	defer cancel()
+
+	conn, err := dialTCP(ctx, target)
+	if err != nil {
+		s.metrics.TargetReachable.Set(0)
+		s.logger.V(1).Info("Target health check failed", "target", target, "error", err.Error())
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"unreachable","target":%q}`, target)
+		return
+	}
+	_ = conn.Close()
+
+	s.metrics.TargetReachable.Set(1)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = fmt.Fprintf(w, `{"status":"ok","target":%q}`, target)
+}
+
 // upgrader configures the WebSocket upgrade.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -95,7 +143,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			"active", s.sessionManager.ActiveCount(),
 			"max", s.config.MaxConnections)
 		s.metrics.ConnectionErrors.WithLabelValues("capacity_exceeded").Inc()
-		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
+		http.Error(w, "Too many concurrent connections", http.StatusTooManyRequests)
 		return
 	}
 	defer s.sessionManager.Release()

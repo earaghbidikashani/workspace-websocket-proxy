@@ -34,6 +34,82 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointDoesNotDialTarget(t *testing.T) {
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = 1
+
+	server := NewServer(config, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected /health to stay 200 with an unreachable target, got %d", w.Code)
+	}
+}
+
+func TestTargetHealthEndpointReachable(t *testing.T) {
+	tcpAddr, cleanupTCP := startEchoTCPServer(t)
+	defer cleanupTCP()
+
+	_, portStr, _ := net.SplitHostPort(tcpAddr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = port
+
+	server := NewServer(config, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "ok") {
+		t.Errorf("expected body to contain 'ok', got %s", w.Body.String())
+	}
+
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 1")
+}
+
+func TestTargetHealthEndpointUnreachable(t *testing.T) {
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = 1
+
+	server := NewServer(config, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "unreachable") {
+		t.Errorf("expected body to contain 'unreachable', got %s", w.Body.String())
+	}
+
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
+}
+
+func assertMetricPresent(t *testing.T, server *Server, want string) {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if !strings.Contains(w.Body.String(), want) {
+		t.Errorf("expected metrics to contain %q", want)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	config := testConfig()
 	server := NewServer(config, testLogger())
@@ -81,8 +157,8 @@ func TestMaxConnections(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected second connection to be rejected")
 	}
-	if resp != nil && resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("expected status 503, got %d", resp.StatusCode)
+	if resp != nil && resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", resp.StatusCode)
 	}
 }
 

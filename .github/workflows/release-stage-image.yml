@@ -24,6 +24,7 @@ on:
 env:
   STAGING_REGISTRY: ghcr.io/jupyter-infra/staging
   IMAGE_NAME: workspace-websocket-proxy
+  SSH_IMAGE_NAME: remote-access-server
 
 jobs:
   build-and-push:
@@ -62,7 +63,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build and push the sidecar image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -73,6 +74,22 @@ jobs:
             ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}
             ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.sha.outputs.short_sha }}
             ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push the remote access server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/remote-access-server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.STAGING_REGISTRY }}/${{ env.SSH_IMAGE_NAME }}:${{ inputs.version }}
+            ${{ env.STAGING_REGISTRY }}/${{ env.SSH_IMAGE_NAME }}:sha-${{ steps.sha.outputs.short_sha }}
+            ${{ env.STAGING_REGISTRY }}/${{ env.SSH_IMAGE_NAME }}:latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ inputs.version }}

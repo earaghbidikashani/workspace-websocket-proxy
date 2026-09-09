@@ -1,5 +1,6 @@
 # Image URL to use for building/pushing image targets
 IMG ?= jupyter-k8s-ws-proxy:latest
+SSH_IMG ?= jupyter-k8s-remote-access-server:latest
 TAG ?= latest
 
 # Container tool (finch preferred for OSS)
@@ -15,8 +16,10 @@ ifeq ($(CONTAINER_TOOL),finch)
   BUILD_OPTS := $(shell if [ -f /etc/os-release ]; then echo "--network host"; else echo ""; fi)
 endif
 
-# Binary name
+# Binary names. ws-proxy runs as the workspace sidecar; remote-access-server is
+# embedded in the workspace image and started there.
 BINARY := ws-proxy
+SSH_BINARY := remote-access-server
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 SHELL = /usr/bin/env bash -o pipefail
@@ -68,8 +71,9 @@ lint-fix: ## Run golangci-lint linter and perform fixes.
 ##@ Build
 
 .PHONY: build
-build: fmt vet ## Build the binary.
+build: fmt vet ## Build both binaries.
 	CGO_ENABLED=0 go build -a -o bin/$(BINARY) ./cmd/ws-proxy
+	CGO_ENABLED=0 go build -a -o bin/$(SSH_BINARY) ./cmd/$(SSH_BINARY)
 
 .PHONY: run
 run: build ## Run locally (for development).
@@ -78,8 +82,12 @@ run: build ## Run locally (for development).
 ##@ Container
 
 .PHONY: docker-build
-docker-build: ## Build container image.
+docker-build: ## Build the sidecar container image.
 	$(CONTAINER_TOOL) build $(BUILD_OPTS) -t $(IMG) .
+
+.PHONY: docker-build-ssh
+docker-build-ssh: ## Build the remote access server image, a carrier for the binary rather than a runnable service.
+	$(CONTAINER_TOOL) build $(BUILD_OPTS) -t $(SSH_IMG) -f images/$(SSH_BINARY)/Dockerfile .
 
 .PHONY: docker-push
 docker-push: ## Push container image.

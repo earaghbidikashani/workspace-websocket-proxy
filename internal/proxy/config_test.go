@@ -34,6 +34,23 @@ func TestConfigDefaults(t *testing.T) {
 	if config.ReadLimit != 65536 {
 		t.Errorf("expected 65536, got %d", config.ReadLimit)
 	}
+	if config.TargetHealthBannerPrefix != "SSH-2.0-" {
+		t.Errorf("expected SSH-2.0-, got %q", config.TargetHealthBannerPrefix)
+	}
+}
+
+// An explicitly empty value must disable the banner check rather than fall back
+// to the default, which is how a non-SSH target opts out.
+func TestConfigBannerPrefixHonoursExplicitEmpty(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_BANNER_PREFIX", "")
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.TargetHealthBannerPrefix != "" {
+		t.Errorf("expected the banner check to be disabled, got %q", config.TargetHealthBannerPrefix)
+	}
 }
 
 func TestConfigTargetAddr(t *testing.T) {

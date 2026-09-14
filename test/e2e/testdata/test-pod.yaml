@@ -36,6 +36,10 @@ spec:
           value: "30s"
         - name: MAX_CONNECTIONS
           value: "10"
+        # The fixture target is a socat echo server, not the remote access
+        # server, so it sends no SSH greeting for /health/target to check.
+        - name: TARGET_HEALTH_BANNER_PREFIX
+          value: ""
       ports:
         - containerPort: 8080
       readinessProbe:

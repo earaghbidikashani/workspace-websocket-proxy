@@ -22,6 +22,14 @@ const (
 
 	defaultMaxSessions = 10
 
+	// defaultIdleTimeout reclaims a connection that has gone quiet. It is
+	// deliberately generous, and matches the proxy's MAX_SESSION_DURATION
+	// default: the proxy tears the WebSocket down at twelve hours, so an SSH
+	// connection cannot usefully outlive that anyway.
+	defaultIdleTimeout = 12 * time.Hour
+
+	loopbackIPv4 = "127.0.0.1"
+
 	hostKeyDirName = ".jupyter-k8s"
 
 	hostKeyFileName = "ssh_host_ed25519_key"
@@ -44,12 +52,19 @@ type Config struct {
 	// changes every time and clients learn to disable host-key checking.
 	HostKeyPath string
 
-	// IdleTimeout closes a connection after this long without I/O. Zero
-	// disables the timeout.
+	// IdleTimeout closes a connection after this long without I/O in either
+	// direction. Zero disables it, which is not advisable: it is the only
+	// backstop for a connection that never tears down cleanly. Expiry cancels
+	// the session context, which is what terminates the session's processes.
 	IdleTimeout time.Duration
 
 	// MaxSessions caps concurrent shell and exec channels. Zero or negative
-	// disables the cap. SFTP subsystems and port forwards are not counted.
+	// disables the cap.
+	//
+	// The cap covers shell and exec channels only. SFTP subsystems and port
+	// forwards do not claim a slot, so concurrent transfers and forwarded
+	// connections are unbounded. That is acceptable for a single-tenant
+	// workspace pod but is worth knowing before relying on the number.
 	MaxSessions int
 
 	// LoginShell runs the session shell with -l, so it reads the user's login
@@ -65,9 +80,9 @@ type Config struct {
 // LoadConfig reads the SSH server configuration from the environment.
 func LoadConfig() *Config {
 	return &Config{
-		ListenAddr:       getEnv("SSH_LISTEN_ADDR", fmt.Sprintf("127.0.0.1:%d", defaultPort)),
+		ListenAddr:       getEnv("SSH_LISTEN_ADDR", fmt.Sprintf("%s:%d", loopbackIPv4, defaultPort)),
 		HostKeyPath:      getEnv("SSH_HOST_KEY_PATH", defaultHostKeyPath()),
-		IdleTimeout:      getDurationEnv("SSH_IDLE_TIMEOUT", 0),
+		IdleTimeout:      getDurationEnv("SSH_IDLE_TIMEOUT", defaultIdleTimeout),
 		MaxSessions:      getIntEnv("SSH_MAX_SESSIONS", defaultMaxSessions),
 		LoginShell:       getBoolEnv("SSH_LOGIN_SHELL", false),
 		AllowNonLoopback: getBoolEnv("SSH_ALLOW_NON_LOOPBACK", false),

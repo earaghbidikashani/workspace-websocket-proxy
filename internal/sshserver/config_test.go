@@ -24,8 +24,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if want := filepath.Join(home, hostKeyDirName, hostKeyFileName); config.HostKeyPath != want {
 		t.Errorf("expected %s, got %s", want, config.HostKeyPath)
 	}
-	if config.IdleTimeout != 0 {
-		t.Errorf("expected 0, got %s", config.IdleTimeout)
+	if config.IdleTimeout != defaultIdleTimeout {
+		t.Errorf("expected %s, got %s", defaultIdleTimeout, config.IdleTimeout)
 	}
 	if config.MaxSessions != defaultMaxSessions {
 		t.Errorf("expected %d, got %d", defaultMaxSessions, config.MaxSessions)
@@ -75,8 +75,8 @@ func TestLoadConfigIgnoresUnparseableValues(t *testing.T) {
 
 	config := LoadConfig()
 
-	if config.IdleTimeout != 0 {
-		t.Errorf("expected fallback 0, got %s", config.IdleTimeout)
+	if config.IdleTimeout != defaultIdleTimeout {
+		t.Errorf("expected fallback %s, got %s", defaultIdleTimeout, config.IdleTimeout)
 	}
 	if config.MaxSessions != defaultMaxSessions {
 		t.Errorf("expected fallback %d, got %d", defaultMaxSessions, config.MaxSessions)

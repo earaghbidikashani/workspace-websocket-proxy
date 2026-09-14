@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+// defaultTargetHealthBannerPrefix is the SSH identification string prefix from
+// RFC 4253 section 4.2. The target is the remote access server, which sends it
+// in the clear before any key exchange, so the check needs no SSH library here
+// and the byte-copying data path stays protocol-agnostic.
+const defaultTargetHealthBannerPrefix = "SSH-2.0-"
+
 // Config holds all configuration for the WebSocket proxy.
 type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
@@ -45,6 +51,13 @@ type Config struct {
 
 	// RevalidationEndpoint is the URL to call for re-validation (future use).
 	RevalidationEndpoint string
+
+	// TargetHealthBannerPrefix is the greeting /health/target expects the target
+	// to send on connect. A bare TCP dial succeeds off the listen backlog even
+	// when the target process is wedged and never calls accept, so the greeting
+	// is what proves the process is alive. Empty disables the check and reduces
+	// /health/target to a dial.
+	TargetHealthBannerPrefix string
 }
 
 // LoadConfig reads configuration from environment variables with sensible defaults.
@@ -61,6 +74,9 @@ func LoadConfig() (*Config, error) {
 		ReadLimit:            int64(getIntEnv("READ_LIMIT", 65536)),
 		RevalidationInterval: getDurationEnv("REVALIDATION_INTERVAL", 5*time.Minute),
 		RevalidationEndpoint: getEnv("REVALIDATION_ENDPOINT", ""),
+
+		TargetHealthBannerPrefix: getEnvAllowEmpty(
+			"TARGET_HEALTH_BANNER_PREFIX", defaultTargetHealthBannerPrefix),
 	}
 
 	if config.TargetPort < 1 || config.TargetPort > 65535 {
@@ -88,6 +104,15 @@ func (c *Config) TargetAddr() string {
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvAllowEmpty is getEnv for settings where an explicitly empty value is
+// meaningful rather than absent.
+func getEnvAllowEmpty(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
 		return value
 	}
 	return defaultValue

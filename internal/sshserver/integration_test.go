@@ -109,6 +109,10 @@ func startProxy(t *testing.T, target string) string {
 		PingTimeout:        2 * time.Second,
 		MaxConnections:     5,
 		ReadLimit:          65536,
+
+		// The target here is the real SSH server, so exercise the banner check
+		// rather than the bare dial.
+		TargetHealthBannerPrefix: "SSH-2.0-",
 	}
 
 	server := proxy.NewServer(config, testLogger())
@@ -389,7 +393,8 @@ func TestProxyTargetHealthReflectsSSHServer(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Errorf("expected status 200 with the SSH server running, got %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("expected status 200 with the SSH server running, got %d (%s)", resp.StatusCode, body)
 	}
 }
 

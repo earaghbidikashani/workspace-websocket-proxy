@@ -7,20 +7,15 @@ package sshserver
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
-	"unsafe"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gliderlabs/ssh"
@@ -42,12 +37,37 @@ const (
 	// by signal N as exit status 128+N.
 	signalExitCodeBase = 128
 
-	hostKeyDirMode  = 0o700
-	hostKeyFileMode = 0o600
+	// killGracePeriod is how long a disconnected session's processes are given
+	// to exit after SIGHUP before they are killed outright.
+	killGracePeriod = 5 * time.Second
 
-	shellBash = "/bin/bash"
-	shellSh   = "/bin/sh"
+	// Global request types from RFC 4254 section 7.1.
+	requestTypeForward       = "tcpip-forward"
+	requestTypeCancelForward = "cancel-tcpip-forward"
+
+	// Bind addresses that select every interface rather than one.
+	bindAnyWildcard = "*"
+	bindAnyIPv4     = "0.0.0.0"
+	bindAnyIPv6     = "::"
 )
+
+// remoteForwardRequest mirrors the wire format that RFC 4254 section 7.1 defines
+// for both tcpip-forward and cancel-tcpip-forward. The library keeps its own
+// copy of this struct unexported, so the fields are redeclared here in order to
+// rewrite the bind address before the library sees it.
+type remoteForwardRequest struct {
+	BindAddr string
+	BindPort uint32
+}
+
+// anyBindAddresses are the bind addresses that mean "every interface" once they
+// reach net.Listen.
+var anyBindAddresses = map[string]bool{
+	"":              true,
+	bindAnyWildcard: true,
+	bindAnyIPv4:     true,
+	bindAnyIPv6:     true,
+}
 
 // Server is the SSH server that terminates remote IDE sessions. It runs inside
 // the workspace container and listens on loopback, where the proxy sidecar
@@ -105,8 +125,8 @@ func New(config *Config, logger logr.Logger) (*Server, error) {
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
 		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        forwardHandler.HandleSSHRequest,
-			"cancel-tcpip-forward": forwardHandler.HandleSSHRequest,
+			requestTypeForward:       s.forceLoopbackForward(forwardHandler.HandleSSHRequest),
+			requestTypeCancelForward: s.forceLoopbackForward(forwardHandler.HandleSSHRequest),
 		},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
 			"sftp": s.handleSFTP,
@@ -128,11 +148,51 @@ func (s *Server) ListenAndServe() error {
 	return s.ssh.ListenAndServe()
 }
 
-// Shutdown closes the listener and terminates active connections immediately.
-// The context is accepted for interface symmetry with the proxy server and is
-// not yet honoured as a drain deadline.
-func (s *Server) Shutdown(_ context.Context) error {
-	return s.ssh.Close()
+// Shutdown closes the listener and drains active connections until ctx expires,
+// then severs whatever is left.
+//
+// Draining matters on a pod rollout: an abrupt close would cut a session
+// mid-command or mid-SFTP write, which can leave a truncated file. The fallback
+// matters just as much, because the underlying Shutdown waits indefinitely when
+// its context has no deadline, so one lingering session would otherwise hold
+// termination open until the kubelet sends SIGKILL.
+func (s *Server) Shutdown(ctx context.Context) error {
+	err := s.ssh.Shutdown(ctx)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		s.logger.Info("Drain deadline passed, closing active connections", "error", err.Error())
+		return s.ssh.Close()
+	}
+	return err
+}
+
+// forceLoopbackForward rewrites a wildcard reverse-forward bind address to
+// loopback before the request reaches next.
+//
+// The library joins the requested bind address with the port and hands the
+// result straight to net.Listen, so an empty address becomes ":port" and listens
+// on every interface in the pod. IDEs send exactly that. OpenSSH forces loopback
+// here under its default GatewayPorts=no, and this keeps the same contract.
+//
+// Both request types go through this wrapper because the library keys its table
+// of active forwards on the joined address. A cancel that was not rewritten
+// identically would not match its entry and would leak the listener.
+func (s *Server) forceLoopbackForward(next ssh.RequestHandler) ssh.RequestHandler {
+	return func(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
+		var payload remoteForwardRequest
+		if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
+			s.logger.Info("Rejected malformed reverse forward request", "type", req.Type)
+			return false, nil
+		}
+
+		if anyBindAddresses[payload.BindAddr] {
+			s.logger.V(1).Info("Rewrote wildcard reverse forward bind address to loopback",
+				"type", req.Type, "requested", payload.BindAddr, "bindPort", payload.BindPort)
+			payload.BindAddr = loopbackIPv4
+			req.Payload = gossh.Marshal(&payload)
+		}
+
+		return next(ctx, srv, req)
+	}
 }
 
 // allowLocalForward authorizes a "direct-tcpip" channel, the forward a client
@@ -153,11 +213,11 @@ func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool
 // the session (ssh -R). IDEs use this for feature forwarding. Only loopback
 // bind addresses are permitted so the listener is not reachable from outside
 // the pod.
+//
+// forceLoopbackForward has already replaced any wildcard address by the time
+// this runs, so every address reaching here is concrete and anything that is not
+// loopback is refused.
 func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort uint32) bool {
-	if bindHost == "" {
-		s.logger.V(1).Info("Accepted reverse forward on implicit loopback bind", "port", bindPort)
-		return true
-	}
 	if !isLoopback(bindHost) {
 		s.logger.Info("Rejected reverse forward on non-loopback bind address",
 			"bindHost", bindHost, "bindPort", bindPort)
@@ -191,12 +251,99 @@ func (s *Server) handleSession(session ssh.Session) {
 		cmd.Dir = home
 	}
 
+	sc := &sessionCmd{cmd: cmd}
+
 	ptyReq, winCh, isPty := session.Pty()
 	if isPty {
-		s.runWithPty(session, cmd, ptyReq, winCh, logger)
+		s.runWithPty(session, sc, ptyReq, winCh, logger)
 		return
 	}
-	s.runWithoutPty(session, cmd, logger)
+	s.runWithoutPty(session, sc, logger)
+}
+
+// sessionCmd owns the process started for a session and serialises signalling it
+// against reaping it.
+//
+// The serialisation is not incidental. Once Wait has reaped the child, the
+// kernel is free to reuse its PID, so a signal sent after the reap could land on
+// an unrelated process group. Making that impossible is cheaper than reasoning
+// about how unlikely it is.
+type sessionCmd struct {
+	cmd *exec.Cmd
+
+	mu     sync.Mutex
+	reaped bool
+}
+
+// signalGroup sends sig to the whole process group of the session's process, so
+// that processes the session backgrounded are included. It is a no-op once the
+// process has been reaped.
+func (sc *sessionCmd) signalGroup(sig syscall.Signal) error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.reaped || sc.cmd.Process == nil {
+		return nil
+	}
+	return syscall.Kill(-sc.cmd.Process.Pid, sig)
+}
+
+// wait reaps the process and marks it reaped so no later signal can be sent.
+func (sc *sessionCmd) wait() error {
+	err := sc.cmd.Wait()
+
+	sc.mu.Lock()
+	sc.reaped = true
+	sc.mu.Unlock()
+
+	return err
+}
+
+// terminateOnDisconnect stops the session's processes if the client goes away
+// before the command exits, and returns a function that cancels the watch.
+//
+// Without this a session can outlive its client indefinitely. The output copy
+// blocks reading from the child, and a child that is silent because it is sitting
+// at an idle prompt never unblocks it, so the process is never signalled, Wait
+// never returns and the session's slot is held for the lifetime of the pod. An
+// interactive shell left open on a laptop that goes to sleep is exactly that
+// case, and it is the ordinary one rather than an unusual one.
+//
+// Signalling the group also releases the blocked copy for free: when the last
+// process holding the pty slave exits, the read on the master fails and teardown
+// proceeds normally.
+func (s *Server) terminateOnDisconnect(session ssh.Session, sc *sessionCmd, logger logr.Logger) (cancel func()) {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+
+		select {
+		case <-done:
+			return
+		case <-session.Context().Done():
+		}
+
+		logger.Info("Client disconnected, hanging up the session process group")
+		if err := sc.signalGroup(syscall.SIGHUP); err != nil {
+			logger.V(1).Info("Failed to hang up the session process group", "error", err.Error())
+		}
+
+		select {
+		case <-done:
+		case <-time.After(killGracePeriod):
+			logger.Info("Session process group outlived the grace period, killing it")
+			if err := sc.signalGroup(syscall.SIGKILL); err != nil {
+				logger.V(1).Info("Failed to kill the session process group", "error", err.Error())
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-finished
+	}
 }
 
 // acquireSession claims one of the MaxSessions slots, reporting false when the
@@ -230,18 +377,23 @@ func (s *Server) releaseSession() {
 // out. The outbound copy returns when the child exits and the kernel reports EIO
 // on the master, which is what ends the session.
 //
-// Teardown order matters. watchWindowSize holds the same *os.File and calls
-// setWinsize on it, and os.File reference-counts Read and Write but not Fd, so
-// closing the master while a resize is in flight is a use-after-close that the
-// race detector reports. The resize goroutine is therefore stopped and joined
-// before the master is closed.
+// Teardown order matters. watchWindowSize holds the same *os.File and resizes it,
+// and os.File reference-counts Read and Write but not Fd, so closing the master
+// while a resize is in flight is a use-after-close that the race detector
+// reports. The resize goroutine is therefore stopped and joined before the master
+// is closed.
+//
+// pty.Start puts the child in a new session with the pty as its controlling
+// terminal, which makes it a process group leader and lets
+// terminateOnDisconnect signal the group.
 func (s *Server) runWithPty(
 	session ssh.Session,
-	cmd *exec.Cmd,
+	sc *sessionCmd,
 	ptyReq ssh.Pty,
 	winCh <-chan ssh.Window,
 	logger logr.Logger,
 ) {
+	cmd := sc.cmd
 	cmd.Env = append(cmd.Env,
 		fmt.Sprintf("TERM=%s", ptyReq.Term),
 		"COLORTERM=truecolor")
@@ -253,8 +405,12 @@ func (s *Server) runWithPty(
 		_ = session.Exit(exitCodeGeneralError)
 		return
 	}
-	setWinsize(f, ptyReq.Window.Width, ptyReq.Window.Height)
-	stopResize, resizeDone := s.watchWindowSize(f, winCh)
+
+	stopWatch := s.terminateOnDisconnect(session, sc, logger)
+	defer stopWatch()
+
+	s.setWinsize(f, ptyReq.Window, logger)
+	stopResize, resizeDone := s.watchWindowSize(f, winCh, logger)
 
 	go func() {
 		_, _ = io.Copy(f, session)
@@ -265,7 +421,7 @@ func (s *Server) runWithPty(
 	<-resizeDone
 	_ = f.Close()
 
-	s.finish(session, cmd, logger)
+	s.finish(session, sc, logger)
 }
 
 // watchWindowSize applies terminal resizes the client sends mid-session, so a
@@ -273,7 +429,11 @@ func (s *Server) runWithPty(
 // size. It returns a channel the caller closes to stop the goroutine and a
 // second channel the goroutine closes once it has returned; the caller must
 // wait on the latter before closing f.
-func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan struct{}, done chan struct{}) {
+func (s *Server) watchWindowSize(
+	f *os.File,
+	winCh <-chan ssh.Window,
+	logger logr.Logger,
+) (stop chan struct{}, done chan struct{}) {
 	stop = make(chan struct{})
 	done = make(chan struct{})
 
@@ -287,7 +447,7 @@ func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan
 				if !ok {
 					return
 				}
-				setWinsize(f, win.Width, win.Height)
+				s.setWinsize(f, win, logger)
 			}
 		}
 	}()
@@ -303,9 +463,20 @@ func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan
 // Stdout and stderr are wired straight to the session. Stdin needs a pipe
 // because the copy has to be closed once the client stops sending: a program
 // reading to EOF would otherwise block forever.
-func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
+//
+// Setpgid is required here, and only here. On the PTY path pty.Start already puts
+// the child in its own session, but a plain Start leaves it in the server's
+// process group, where signalling the group by negative PID fails with ESRCH and
+// terminateOnDisconnect would silently do nothing.
+func (s *Server) runWithoutPty(session ssh.Session, sc *sessionCmd, logger logr.Logger) {
+	cmd := sc.cmd
 	cmd.Stdout = session
 	cmd.Stderr = session.Stderr()
+
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -321,18 +492,21 @@ func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.L
 		return
 	}
 
+	stopWatch := s.terminateOnDisconnect(session, sc, logger)
+	defer stopWatch()
+
 	go func() {
 		_, _ = io.Copy(stdin, session)
 		_ = stdin.Close()
 	}()
 
-	s.finish(session, cmd, logger)
+	s.finish(session, sc, logger)
 }
 
 // finish reaps the child and reports its status to the client as the channel's
 // exit-status request.
-func (s *Server) finish(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
-	code := exitCode(cmd.Wait())
+func (s *Server) finish(session ssh.Session, sc *sessionCmd, logger logr.Logger) {
+	code := exitCode(sc.wait())
 	logger.Info("Session closed", "exitCode", code)
 	_ = session.Exit(code)
 }
@@ -388,130 +562,13 @@ func (s *Server) handleSFTP(session ssh.Session) {
 	_ = session.Exit(0)
 }
 
-// buildShellCommand assembles the command for a session: the shell on its own
-// for an interactive login, or the shell with -c for an exec request. The
-// command always goes through a shell so that quoting, pipes and redirection in
-// what the client sent behave the way the client expects.
-func buildShellCommand(shell string, loginShell bool, rawCmd string) *exec.Cmd {
-	if strings.TrimSpace(rawCmd) == "" {
-		if loginShell {
-			return exec.Command(shell, "-l")
-		}
-		return exec.Command(shell)
-	}
-
-	if loginShell {
-		return exec.Command(shell, "-lc", rawCmd)
-	}
-	return exec.Command(shell, "-c", rawCmd)
-}
-
-// resolveShell picks the shell to run, preferring $SHELL and falling back to
-// bash then sh. Workspace images vary, so the candidates are probed rather than
-// assumed.
-func resolveShell() string {
-	candidates := []string{os.Getenv("SHELL"), shellBash, shellSh}
-	for _, candidate := range candidates {
-		if candidate == "" {
-			continue
-		}
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate
-		}
-	}
-	return shellSh
-}
-
-// mergeEnv combines the server process's environment with the variables the
-// client sent, letting the client win on conflicts. The process environment is
-// the base because it carries the image's own setup, such as PATH and the
-// virtualenv, that the workspace needs.
-func mergeEnv(sessionEnv []string) []string {
-	merged := map[string]string{}
-	for _, entry := range append(os.Environ(), sessionEnv...) {
-		if key, value, ok := strings.Cut(entry, "="); ok {
-			merged[key] = value
-		}
-	}
-
-	out := make([]string, 0, len(merged))
-	for key, value := range merged {
-		out = append(out, key+"="+value)
-	}
-	return out
-}
-
-// lookupEnv reads a variable out of an environment slice, for the merged
-// environment that has not been applied to the process.
-func lookupEnv(env []string, key string) (string, bool) {
-	prefix := key + "="
-	for _, entry := range env {
-		if strings.HasPrefix(entry, prefix) {
-			return strings.TrimPrefix(entry, prefix), true
-		}
-	}
-	return "", false
-}
-
-// loadOrCreateHostKey returns the host key at path, generating and persisting
-// one on first use, and reports whether it generated it. Persisting matters:
-// with an ephemeral key the fingerprint changes on every restart and clients
-// learn to disable host-key checking. A key that exists but cannot be parsed is
-// an error rather than a cause to overwrite it.
-func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err error) {
-	pemBytes, readErr := os.ReadFile(path)
-	switch {
-	case readErr == nil:
-		parsed, parseErr := gossh.ParsePrivateKey(pemBytes)
-		if parseErr != nil {
-			return nil, false, fmt.Errorf("existing host key at %s is unreadable: %w", path, parseErr)
-		}
-		return parsed, false, nil
-	case !errors.Is(readErr, os.ErrNotExist):
-		return nil, false, fmt.Errorf("failed to read host key at %s: %w", path, readErr)
-	}
-
-	generatedPEM, err := generateHostKeyPEM()
-	if err != nil {
-		return nil, false, err
-	}
-
-	if mkErr := os.MkdirAll(filepath.Dir(path), hostKeyDirMode); mkErr != nil {
-		return nil, false, fmt.Errorf("failed to create host key directory: %w", mkErr)
-	}
-	if writeErr := os.WriteFile(path, generatedPEM, hostKeyFileMode); writeErr != nil {
-		return nil, false, fmt.Errorf("failed to write host key to %s: %w", path, writeErr)
-	}
-
-	parsed, err := gossh.ParsePrivateKey(generatedPEM)
-	if err != nil {
-		return nil, false, fmt.Errorf("failed to parse generated host key: %w", err)
-	}
-	return parsed, true, nil
-}
-
-// generateHostKeyPEM creates a new ed25519 host key as PKCS#8 PEM.
-func generateHostKeyPEM() ([]byte, error) {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate host key: %w", err)
-	}
-
-	der, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal host key: %w", err)
-	}
-
-	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
-}
-
 // setWinsize tells the pty its dimensions, which is what makes full-screen
-// programs in the session lay out correctly.
-func setWinsize(f *os.File, w, h int) {
-	winsize := struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0}
-	_, _, _ = syscall.Syscall(
-		syscall.SYS_IOCTL,
-		f.Fd(),
-		uintptr(syscall.TIOCSWINSZ),
-		uintptr(unsafe.Pointer(&winsize)))
+// programs in the session lay out correctly. A failed resize is logged rather
+// than fatal: the session remains usable, it is only drawn at the wrong size.
+func (s *Server) setWinsize(f *os.File, win ssh.Window, logger logr.Logger) {
+	size := &pty.Winsize{Rows: uint16(win.Height), Cols: uint16(win.Width)}
+	if err := pty.Setsize(f, size); err != nil {
+		logger.V(1).Info("Failed to resize pty",
+			"rows", win.Height, "cols", win.Width, "error", err.Error())
+	}
 }

@@ -84,10 +84,13 @@ A supervisor is required because the server has to be listening before any clien
 | `TARGET_HOST` / `TARGET_PORT` | `127.0.0.1` / `2222` | Where it forwards bytes |
 | `MAX_SESSION_DURATION` | `12h` | Hard cap on one connection |
 | `PING_INTERVAL` / `PING_TIMEOUT` | `30s` / `60s` | Keepalive and dead-peer detection |
-| `MAX_CONNECTIONS` | `10` | Concurrency cap, rejected with 429 |
+| `MAX_CONNECTIONS` | `10` | Concurrency cap, rejected with 429 and a `Retry-After` |
 | `READ_LIMIT` | `65536` | Maximum inbound message size |
+| `TARGET_HEALTH_BANNER_PREFIX` | `SSH-2.0-` | Greeting `/health/target` expects from the target. Empty disables the check. |
 
-Endpoints: `/health` reports on the proxy process only and is safe for a pod readiness probe. `/health/target` dials the target and is intended for alerting, not readiness, because pod readiness gates every port on the pod. `/metrics` serves Prometheus metrics.
+Endpoints: `/health` reports on the proxy process only and is safe for a pod readiness probe. `/health/target` probes the target and is intended for alerting, not readiness, because pod readiness gates every port on the pod. `/metrics` serves Prometheus metrics.
+
+`/health/target` connects and then reads the target's greeting rather than only dialing, because the kernel completes a TCP handshake from the listen backlog even when the target process is wedged and never accepts, so a dial alone reports a deadlocked server as healthy. Point `TARGET_HEALTH_BANNER_PREFIX` at whatever the target announces, or set it empty for a target that announces nothing.
 
 `remote-access-server`, from the environment, with `--port`, `--host-key` and `--login-shell` overriding:
 
@@ -95,12 +98,16 @@ Endpoints: `/health` reports on the proxy process only and is safe for a pod rea
 |---|---|---|
 | `SSH_LISTEN_ADDR` | `127.0.0.1:2222` | Bind address, must be loopback |
 | `SSH_HOST_KEY_PATH` | `$HOME/.jupyter-k8s/ssh_host_ed25519_key` | Persisted host key, generated on first use |
-| `SSH_IDLE_TIMEOUT` | `0` (disabled) | Close a session with no traffic |
-| `SSH_MAX_SESSIONS` | `10` | Concurrent session cap, `0` disables |
+| `SSH_IDLE_TIMEOUT` | `12h` | Close a connection with no traffic in either direction. `0` disables. |
+| `SSH_MAX_SESSIONS` | `10` | Concurrent shell and exec cap, `0` disables |
 | `SSH_LOGIN_SHELL` | `false` | Run the session shell as a login shell |
 | `SSH_ALLOW_NON_LOOPBACK` | `false` | Permit a routable bind. Publishes an unauthenticated shell. |
 
 Persist the host key on storage that survives a container restart, otherwise every reconnect reports a changed host key. Enable `SSH_LOGIN_SHELL` for images that put their interpreter on `PATH` through a shell profile, such as conda-based images, rather than through the image environment.
+
+`SSH_MAX_SESSIONS` bounds shell and exec channels only. SFTP subsystems and port forwards do not claim a slot, so concurrent transfers and forwarded connections are unbounded, which is acceptable for a single-tenant workspace pod but worth knowing before relying on the number.
+
+When a client disconnects, the session's process group is sent `SIGHUP` and then `SIGKILL` after a short grace period. Signalling the group rather than the shell alone means processes the session backgrounded go with it. On `SIGTERM` the server drains active sessions for up to twenty seconds before severing what remains, so a rollout does not cut a command or an SFTP write mid-write.
 
 ## Development
 

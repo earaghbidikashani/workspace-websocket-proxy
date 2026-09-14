@@ -6,13 +6,21 @@ Distributed under the terms of the MIT license
 package sshserver
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	"github.com/gliderlabs/ssh"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
@@ -35,7 +43,7 @@ func testConfig(t *testing.T) *Config {
 
 func TestNewRejectsNonLoopbackBind(t *testing.T) {
 	config := testConfig(t)
-	config.ListenAddr = "0.0.0.0:2222"
+	config.ListenAddr = bindAnyIPv4 + ":2222"
 
 	if _, err := New(config, testLogger()); err == nil {
 		t.Fatal("expected New to refuse a non-loopback bind")
@@ -44,7 +52,7 @@ func TestNewRejectsNonLoopbackBind(t *testing.T) {
 
 func TestNewAllowsNonLoopbackBindWithOverride(t *testing.T) {
 	config := testConfig(t)
-	config.ListenAddr = "0.0.0.0:2222"
+	config.ListenAddr = bindAnyIPv4 + ":2222"
 	config.AllowNonLoopback = true
 
 	if _, err := New(config, testLogger()); err != nil {
@@ -101,7 +109,7 @@ func TestForwardCallbacksRestrictToLoopback(t *testing.T) {
 		{"loopback ipv4", "127.0.0.1", true},
 		{"loopback ipv6", "::1", true},
 		{localhostHost, localhostHost, true},
-		{"wildcard", "0.0.0.0", false},
+		{"wildcard", bindAnyIPv4, false},
 		{"routable", "10.0.0.5", false},
 	}
 
@@ -117,14 +125,322 @@ func TestForwardCallbacksRestrictToLoopback(t *testing.T) {
 	}
 }
 
-func TestAllowReverseForwardAcceptsImplicitBind(t *testing.T) {
+// The callback is fail-closed: forceLoopbackForward has already turned any
+// wildcard into a concrete loopback address, so an empty address reaching here
+// would be a bug and must not be treated as loopback.
+func TestAllowReverseForwardRejectsWildcardBind(t *testing.T) {
 	server, err := New(testConfig(t), testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !server.allowReverseForward(nil, "", 8888) {
-		t.Error("an empty bind address means loopback and must be accepted")
+	for _, bindAddr := range []string{"", bindAnyWildcard, bindAnyIPv4, bindAnyIPv6} {
+		if server.allowReverseForward(nil, bindAddr, 8888) {
+			t.Errorf("expected bind address %q to be refused by the callback", bindAddr)
+		}
+	}
+}
+
+// An unrewritten wildcard bind would reach net.Listen as ":port" and listen on
+// every interface in the pod, which is what this rewrite exists to prevent.
+func TestForceLoopbackForwardRewritesWildcardBind(t *testing.T) {
+	server, err := New(testConfig(t), testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		requested string
+		want      string
+	}{
+		{"empty as sent by IDEs", "", loopbackIPv4},
+		{"asterisk", bindAnyWildcard, loopbackIPv4},
+		{"ipv4 any", bindAnyIPv4, loopbackIPv4},
+		{"ipv6 any", bindAnyIPv6, loopbackIPv4},
+		{"explicit loopback is untouched", loopbackIPv4, loopbackIPv4},
+		{"routable address is passed through to be refused", "10.0.0.5", "10.0.0.5"},
+	}
+
+	for _, requestType := range []string{requestTypeForward, requestTypeCancelForward} {
+		for _, tc := range tests {
+			t.Run(requestType+"/"+tc.name, func(t *testing.T) {
+				var seen remoteForwardRequest
+				next := func(_ ssh.Context, _ *ssh.Server, req *gossh.Request) (bool, []byte) {
+					if err := gossh.Unmarshal(req.Payload, &seen); err != nil {
+						t.Fatalf("payload handed to next is malformed: %v", err)
+					}
+					return true, nil
+				}
+
+				req := &gossh.Request{
+					Type: requestType,
+					Payload: gossh.Marshal(&remoteForwardRequest{
+						BindAddr: tc.requested,
+						BindPort: 8888,
+					}),
+				}
+
+				ok, _ := server.forceLoopbackForward(next)(nil, nil, req)
+				if !ok {
+					t.Fatal("expected the request to be delegated")
+				}
+				if seen.BindAddr != tc.want {
+					t.Errorf("bind address handed to next = %q, want %q", seen.BindAddr, tc.want)
+				}
+				if seen.BindPort != 8888 {
+					t.Errorf("bind port was altered: got %d, want 8888", seen.BindPort)
+				}
+			})
+		}
+	}
+}
+
+func TestForceLoopbackForwardRejectsMalformedPayload(t *testing.T) {
+	server, err := New(testConfig(t), testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	next := func(_ ssh.Context, _ *ssh.Server, _ *gossh.Request) (bool, []byte) {
+		t.Fatal("a malformed request must not be delegated")
+		return true, nil
+	}
+
+	req := &gossh.Request{Type: requestTypeForward, Payload: []byte{0xff}}
+	if ok, _ := server.forceLoopbackForward(next)(nil, nil, req); ok {
+		t.Error("expected a malformed request to be refused")
+	}
+}
+
+// startTestServer runs a real SSH server on an ephemeral loopback port. The
+// listener is created first because Config.validate rejects port 0.
+func startTestServer(t *testing.T) (*Server, string) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve a port: %v", err)
+	}
+
+	config := testConfig(t)
+	config.ListenAddr = listener.Addr().String()
+
+	server, err := New(config, testLogger())
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("failed to create the server: %v", err)
+	}
+
+	go func() { _ = server.ssh.Serve(listener) }()
+	t.Cleanup(func() { _ = server.ssh.Close() })
+
+	// Serve registers its listener asynchronously, and the socket is already
+	// bound, so dialing proves nothing on its own: the kernel would accept from
+	// the backlog regardless. A completed handshake is what shows Serve has
+	// reached its accept loop. Without this, a Shutdown can run first and find no
+	// listener to close, and the library then clears its done channel when the
+	// listener finally registers, leaving Serve blocked in Accept.
+	warmup := dialTestClient(t, config.ListenAddr)
+	_ = warmup.Close()
+
+	return server, config.ListenAddr
+}
+
+func dialTestClient(t *testing.T, addr string) *gossh.Client {
+	t.Helper()
+
+	client, err := gossh.Dial("tcp", addr, &gossh.ClientConfig{
+		User:            "workspace",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to connect to the server: %v", err)
+	}
+	return client
+}
+
+// startSilentCommand runs a command that records its own PID and then produces no
+// further output, which is the case that used to hang teardown.
+func startSilentCommand(t *testing.T, client *gossh.Client, withPty bool) (pid int) {
+	t.Helper()
+
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open a session: %v", err)
+	}
+
+	if withPty {
+		if err := session.RequestPty("xterm", 24, 80, gossh.TerminalModes{}); err != nil {
+			t.Fatalf("failed to request a pty: %v", err)
+		}
+	}
+
+	if err := session.Start(fmt.Sprintf("echo $$ > %s; exec sleep 300", pidFile)); err != nil {
+		t.Fatalf("failed to start the command: %v", err)
+	}
+
+	// The session is deliberately not closed or waited on: the caller's point is
+	// to abandon it while the command is still running.
+	return waitForPidFile(t, pidFile)
+}
+
+func waitForPidFile(t *testing.T, path string) int {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if contents, err := os.ReadFile(path); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(contents))); convErr == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("the command never recorded its pid in %s", path)
+	return 0
+}
+
+// processAlive reports whether pid still names a live process. Signal 0 performs
+// only the permission and existence checks.
+func processAlive(pid int) bool {
+	return syscall.Kill(pid, 0) == nil
+}
+
+func waitForCondition(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// A client that disappears must not leave its processes running and must not
+// leak the session slot. The output copy blocks reading from a silent child, so
+// before the disconnect watcher existed this hung until the pod restarted.
+func TestSessionProcessesDieOnClientDisconnect(t *testing.T) {
+	tests := []struct {
+		name    string
+		withPty bool
+	}{
+		{"pty path", true},
+		{"exec path", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server, addr := startTestServer(t)
+			client := dialTestClient(t, addr)
+
+			pid := startSilentCommand(t, client, tc.withPty)
+
+			if !processAlive(pid) {
+				t.Fatalf("precondition: the child %d should be running", pid)
+			}
+			if got := server.sessions.Load(); got != 1 {
+				t.Fatalf("precondition: expected 1 active session, got %d", got)
+			}
+
+			// Drop the client without letting the command finish.
+			_ = client.Close()
+
+			waitForCondition(t, fmt.Sprintf("child %d to exit", pid), func() bool {
+				return !processAlive(pid)
+			})
+			waitForCondition(t, "the session slot to be released", func() bool {
+				return server.sessions.Load() == 0
+			})
+		})
+	}
+}
+
+// The disconnect watcher signals the process group by negative PID, which only
+// reaches the child if the child leads its own group. pty.Start arranges that on
+// the PTY path; the exec path needs Setpgid, and without it the signal fails with
+// ESRCH and the fix silently does nothing.
+func TestSessionChildLeadsItsOwnProcessGroup(t *testing.T) {
+	for _, withPty := range []bool{true, false} {
+		name := "exec path"
+		if withPty {
+			name = "pty path"
+		}
+
+		t.Run(name, func(t *testing.T) {
+			_, addr := startTestServer(t)
+			client := dialTestClient(t, addr)
+			defer func() { _ = client.Close() }()
+
+			pid := startSilentCommand(t, client, withPty)
+
+			pgid, err := syscall.Getpgid(pid)
+			if err != nil {
+				t.Fatalf("failed to read the process group of %d: %v", pid, err)
+			}
+			if pgid != pid {
+				t.Errorf("child %d is in process group %d, so a negative-PID signal "+
+					"would miss it; expected the child to lead its own group", pid, pgid)
+			}
+			if selfPgid, _ := syscall.Getpgid(os.Getpid()); pgid == selfPgid {
+				t.Errorf("child shares the server's process group %d, so signalling "+
+					"the group would target the server itself", selfPgid)
+			}
+		})
+	}
+}
+
+// The underlying Shutdown waits indefinitely when its context has no deadline,
+// so an idle client must not be able to hold termination open. Shutdown has to
+// give up at the deadline and sever what is left rather than returning the
+// context error and leaving the connection intact.
+func TestShutdownFallsBackToCloseAfterDrainDeadline(t *testing.T) {
+	server, addr := startTestServer(t)
+
+	client := dialTestClient(t, addr)
+	defer func() { _ = client.Close() }()
+
+	// Hold a session open so the drain has something to wait for.
+	pid := startSilentCommand(t, client, false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("expected Shutdown to recover by closing connections, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Shutdown took %s, which suggests it waited without a deadline", elapsed)
+	}
+
+	// Severing the connection cancels the session context, so the session's
+	// processes are cleaned up rather than left behind.
+	waitForCondition(t, fmt.Sprintf("child %d to exit after shutdown", pid), func() bool {
+		return !processAlive(pid)
+	})
+}
+
+func TestShutdownReturnsPromptlyWithNoConnections(t *testing.T) {
+	server, _ := startTestServer(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("expected a clean shutdown, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Shutdown with no connections took %s", elapsed)
 	}
 }
 

@@ -98,6 +98,108 @@ func TestTargetHealthEndpointUnreachable(t *testing.T) {
 	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
 }
 
+// targetHealthStatus runs one /health/target request against a server pointed at
+// addr with the given expected banner prefix.
+func targetHealthStatus(t *testing.T, addr, bannerPrefix string) (int, string, *Server) {
+	t.Helper()
+
+	_, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = port
+	config.TargetHealthBannerPrefix = bannerPrefix
+
+	server := NewServer(config, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	return w.Code, w.Body.String(), server
+}
+
+func TestTargetHealthAcceptsExpectedBanner(t *testing.T) {
+	addr, cleanup := startBannerTCPServer(t, "SSH-2.0-remote-access-server\r\n")
+	defer cleanup()
+
+	code, body, server := targetHealthStatus(t, addr, defaultTargetHealthBannerPrefix)
+
+	if code != http.StatusOK {
+		t.Errorf("expected status 200, got %d (body %s)", code, body)
+	}
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 1")
+}
+
+func TestTargetHealthRejectsWrongBanner(t *testing.T) {
+	addr, cleanup := startBannerTCPServer(t, "HTTP/1.1 200 OK\r\n")
+	defer cleanup()
+
+	code, body, server := targetHealthStatus(t, addr, defaultTargetHealthBannerPrefix)
+
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503 for a non-SSH greeting, got %d", code)
+	}
+	if !strings.Contains(body, "does not start with") {
+		t.Errorf("expected body to explain the greeting mismatch, got %s", body)
+	}
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
+}
+
+// A bare dial cannot tell a wedged target from a healthy one, which is the whole
+// reason the banner check exists.
+func TestTargetHealthDetectsWedgedTarget(t *testing.T) {
+	addr, cleanup := startWedgedTCPServer(t)
+	defer cleanup()
+
+	code, _, _ := targetHealthStatus(t, addr, "")
+	if code != http.StatusOK {
+		t.Fatalf("precondition: a bare dial should succeed off the listen backlog, got %d", code)
+	}
+
+	code, body, server := targetHealthStatus(t, addr, defaultTargetHealthBannerPrefix)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503 for a listening but wedged target, got %d", code)
+	}
+	if !strings.Contains(body, "read no greeting") {
+		t.Errorf("expected body to report a missing greeting, got %s", body)
+	}
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
+}
+
+func TestTargetHealthSkipsBannerWhenPrefixEmpty(t *testing.T) {
+	addr, cleanup := startEchoTCPServer(t)
+	defer cleanup()
+
+	code, body, _ := targetHealthStatus(t, addr, "")
+	if code != http.StatusOK {
+		t.Errorf("expected status 200 with the banner check disabled, got %d (body %s)", code, body)
+	}
+}
+
+func TestCapacityRejectionSetsRetryAfter(t *testing.T) {
+	config := testConfig()
+	config.MaxConnections = 1
+	server := NewServer(config, testLogger())
+
+	if !server.sessionManager.Acquire() {
+		t.Fatal("expected to acquire the only slot")
+	}
+	defer server.sessionManager.Release()
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Errorf("expected status 429, got %d", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != capacityRetryAfterSeconds {
+		t.Errorf("expected Retry-After %q, got %q", capacityRetryAfterSeconds, got)
+	}
+}
+
 func assertMetricPresent(t *testing.T, server *Server, want string) {
 	t.Helper()
 

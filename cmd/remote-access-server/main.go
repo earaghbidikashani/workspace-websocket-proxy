@@ -16,12 +16,19 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gliderlabs/ssh"
 	"github.com/go-logr/zapr"
 	"github.com/jupyter-infra/workspace-websocket-proxy/internal/sshserver"
 	"go.uber.org/zap"
 )
+
+// shutdownDrainTimeout bounds how long active sessions are given to finish after
+// SIGTERM. It must stay comfortably below the pod's
+// terminationGracePeriodSeconds, which defaults to thirty seconds, so that the
+// drain and the fallback both complete before the kubelet sends SIGKILL.
+const shutdownDrainTimeout = 20 * time.Second
 
 func main() {
 	zapLog, err := zap.NewProduction()
@@ -64,8 +71,15 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		logger.Info("Shutting down SSH server")
-		if err := server.Shutdown(context.Background()); err != nil {
+		logger.Info("Shutting down SSH server", "drainTimeout", shutdownDrainTimeout)
+
+		// A fresh context: ctx is already cancelled by the signal, and the drain
+		// needs a deadline of its own so a lingering session cannot hold
+		// termination open until the kubelet resorts to SIGKILL.
+		drainCtx, cancelDrain := context.WithTimeout(context.Background(), shutdownDrainTimeout)
+		defer cancelDrain()
+
+		if err := server.Shutdown(drainCtx); err != nil {
 			logger.Error(err, "SSH server shutdown failed")
 			os.Exit(1)
 		}

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -20,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gliderlabs/ssh"
 	"github.com/go-logr/logr"
 	"github.com/go-logr/zapr"
 	"go.uber.org/zap"
@@ -125,8 +125,8 @@ func TestForwardCallbacksRestrictToLoopback(t *testing.T) {
 	}
 }
 
-// The callback is fail-closed: forceLoopbackForward has already turned any
-// wildcard into a concrete loopback address, so an empty address reaching here
+// The callback is fail-closed: loopbackForwardHandler resolves a wildcard to a
+// concrete loopback address before calling it, so an empty address reaching here
 // would be a bug and must not be treated as loopback.
 func TestAllowReverseForwardRejectsWildcardBind(t *testing.T) {
 	server, err := New(testConfig(t), testLogger())
@@ -138,78 +138,6 @@ func TestAllowReverseForwardRejectsWildcardBind(t *testing.T) {
 		if server.allowReverseForward(nil, bindAddr, 8888) {
 			t.Errorf("expected bind address %q to be refused by the callback", bindAddr)
 		}
-	}
-}
-
-// An unrewritten wildcard bind would reach net.Listen as ":port" and listen on
-// every interface in the pod, which is what this rewrite exists to prevent.
-func TestForceLoopbackForwardRewritesWildcardBind(t *testing.T) {
-	server, err := New(testConfig(t), testLogger())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	tests := []struct {
-		name      string
-		requested string
-		want      string
-	}{
-		{"empty as sent by IDEs", "", loopbackIPv4},
-		{"asterisk", bindAnyWildcard, loopbackIPv4},
-		{"ipv4 any", bindAnyIPv4, loopbackIPv4},
-		{"ipv6 any", bindAnyIPv6, loopbackIPv4},
-		{"explicit loopback is untouched", loopbackIPv4, loopbackIPv4},
-		{"routable address is passed through to be refused", "10.0.0.5", "10.0.0.5"},
-	}
-
-	for _, requestType := range []string{requestTypeForward, requestTypeCancelForward} {
-		for _, tc := range tests {
-			t.Run(requestType+"/"+tc.name, func(t *testing.T) {
-				var seen remoteForwardRequest
-				next := func(_ ssh.Context, _ *ssh.Server, req *gossh.Request) (bool, []byte) {
-					if err := gossh.Unmarshal(req.Payload, &seen); err != nil {
-						t.Fatalf("payload handed to next is malformed: %v", err)
-					}
-					return true, nil
-				}
-
-				req := &gossh.Request{
-					Type: requestType,
-					Payload: gossh.Marshal(&remoteForwardRequest{
-						BindAddr: tc.requested,
-						BindPort: 8888,
-					}),
-				}
-
-				ok, _ := server.forceLoopbackForward(next)(nil, nil, req)
-				if !ok {
-					t.Fatal("expected the request to be delegated")
-				}
-				if seen.BindAddr != tc.want {
-					t.Errorf("bind address handed to next = %q, want %q", seen.BindAddr, tc.want)
-				}
-				if seen.BindPort != 8888 {
-					t.Errorf("bind port was altered: got %d, want 8888", seen.BindPort)
-				}
-			})
-		}
-	}
-}
-
-func TestForceLoopbackForwardRejectsMalformedPayload(t *testing.T) {
-	server, err := New(testConfig(t), testLogger())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	next := func(_ ssh.Context, _ *ssh.Server, _ *gossh.Request) (bool, []byte) {
-		t.Fatal("a malformed request must not be delegated")
-		return true, nil
-	}
-
-	req := &gossh.Request{Type: requestTypeForward, Payload: []byte{0xff}}
-	if ok, _ := server.forceLoopbackForward(next)(nil, nil, req); ok {
-		t.Error("expected a malformed request to be refused")
 	}
 }
 
@@ -628,6 +556,77 @@ func TestMergeEnvKeepsProcessEnvironment(t *testing.T) {
 	if !slices.Contains(merged, "SSHSERVER_TEST_KEEP=kept") {
 		t.Error("expected process environment entries to be preserved")
 	}
+}
+
+// supervisord starts a program under user= without setting HOME or USER, so the
+// server can inherit an environment that has neither. A session must still land
+// in a home directory, because IDEs install their server component under $HOME.
+func TestWithPasswdFallbackFillsMissingAccountVariables(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Skipf("cannot resolve the current user: %v", err)
+	}
+
+	filled := withPasswdFallback([]string{"PATH=/usr/bin"})
+
+	if home, ok := lookupEnv(filled, envHome); !ok || home != current.HomeDir {
+		t.Errorf("expected HOME=%q from the passwd entry, got %q (found=%v)",
+			current.HomeDir, home, ok)
+	}
+	for _, key := range []string{envUser, envLogname} {
+		if value, ok := lookupEnv(filled, key); !ok || value != current.Username {
+			t.Errorf("expected %s=%q from the passwd entry, got %q (found=%v)",
+				key, current.Username, value, ok)
+		}
+	}
+}
+
+func TestWithPasswdFallbackLeavesExistingValuesAlone(t *testing.T) {
+	env := []string{
+		envHome + "=/home/client",
+		envUser + "=client",
+		envLogname + "=client",
+	}
+
+	filled := withPasswdFallback(slices.Clone(env))
+
+	if !slices.Equal(filled, env) {
+		t.Errorf("expected the environment to be untouched, got %v", filled)
+	}
+}
+
+func TestSessionWorkingDir(t *testing.T) {
+	existing := t.TempDir()
+
+	tests := []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"existing home", []string{envHome + "=" + existing}, existing},
+		{"missing home", []string{"PATH=/usr/bin"}, ""},
+		{"empty home", []string{envHome + "="}, ""},
+		{"home that does not exist", []string{envHome + "=" + existing + "/nope"}, ""},
+		{"home that is a file", []string{envHome + "=" + writeTempFile(t, existing)}, ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionWorkingDir(tc.env); got != tc.want {
+				t.Errorf("sessionWorkingDir() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func writeTempFile(t *testing.T, dir string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatalf("failed to create the fixture file: %v", err)
+	}
+	return path
 }
 
 func TestLookupEnv(t *testing.T) {

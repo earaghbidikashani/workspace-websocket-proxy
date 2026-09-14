@@ -24,3 +24,6 @@ jobs:
 
       - name: Build Docker image
         run: make docker-build CONTAINER_TOOL=docker
+
+      - name: Build remote access server image
+        run: make docker-build-ssh CONTAINER_TOOL=docker

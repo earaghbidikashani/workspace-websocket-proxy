@@ -52,9 +52,9 @@ const (
 )
 
 // remoteForwardRequest mirrors the wire format that RFC 4254 section 7.1 defines
-// for both tcpip-forward and cancel-tcpip-forward. The library keeps its own
-// copy of this struct unexported, so the fields are redeclared here in order to
-// rewrite the bind address before the library sees it.
+// for both tcpip-forward and cancel-tcpip-forward. The library keeps its own copy
+// of this struct unexported, so the fields are redeclared here for
+// loopbackForwardHandler to read.
 type remoteForwardRequest struct {
 	BindAddr string
 	BindPort uint32
@@ -110,7 +110,7 @@ func New(config *Config, logger logr.Logger) (*Server, error) {
 	}
 
 	s := &Server{config: config, logger: logger}
-	forwardHandler := &ssh.ForwardedTCPHandler{}
+	forwardHandler := newLoopbackForwardHandler(logger)
 
 	s.ssh = &ssh.Server{
 		Addr:                          config.ListenAddr,
@@ -125,8 +125,8 @@ func New(config *Config, logger logr.Logger) (*Server, error) {
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
 		RequestHandlers: map[string]ssh.RequestHandler{
-			requestTypeForward:       s.forceLoopbackForward(forwardHandler.HandleSSHRequest),
-			requestTypeCancelForward: s.forceLoopbackForward(forwardHandler.HandleSSHRequest),
+			requestTypeForward:       forwardHandler.HandleSSHRequest,
+			requestTypeCancelForward: forwardHandler.HandleSSHRequest,
 		},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
 			"sftp": s.handleSFTP,
@@ -165,36 +165,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// forceLoopbackForward rewrites a wildcard reverse-forward bind address to
-// loopback before the request reaches next.
-//
-// The library joins the requested bind address with the port and hands the
-// result straight to net.Listen, so an empty address becomes ":port" and listens
-// on every interface in the pod. IDEs send exactly that. OpenSSH forces loopback
-// here under its default GatewayPorts=no, and this keeps the same contract.
-//
-// Both request types go through this wrapper because the library keys its table
-// of active forwards on the joined address. A cancel that was not rewritten
-// identically would not match its entry and would leak the listener.
-func (s *Server) forceLoopbackForward(next ssh.RequestHandler) ssh.RequestHandler {
-	return func(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
-		var payload remoteForwardRequest
-		if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
-			s.logger.Info("Rejected malformed reverse forward request", "type", req.Type)
-			return false, nil
-		}
-
-		if anyBindAddresses[payload.BindAddr] {
-			s.logger.V(1).Info("Rewrote wildcard reverse forward bind address to loopback",
-				"type", req.Type, "requested", payload.BindAddr, "bindPort", payload.BindPort)
-			payload.BindAddr = loopbackIPv4
-			req.Payload = gossh.Marshal(&payload)
-		}
-
-		return next(ctx, srv, req)
-	}
-}
-
 // allowLocalForward authorizes a "direct-tcpip" channel, the forward a client
 // opens to reach a port inside the pod (ssh -L). Only loopback destinations are
 // permitted, so a session cannot use the pod as a jump host into the cluster
@@ -214,8 +184,8 @@ func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool
 // bind addresses are permitted so the listener is not reachable from outside
 // the pod.
 //
-// forceLoopbackForward has already replaced any wildcard address by the time
-// this runs, so every address reaching here is concrete and anything that is not
+// loopbackForwardHandler resolves a wildcard request to loopback before calling
+// this, so every address reaching here is concrete and anything that is not
 // loopback is refused.
 func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort uint32) bool {
 	if !isLoopback(bindHost) {
@@ -246,10 +216,8 @@ func (s *Server) handleSession(session ssh.Session) {
 	logger.Info("Session opened")
 
 	cmd := buildShellCommand(resolveShell(), s.config.LoginShell, session.RawCommand())
-	cmd.Env = mergeEnv(session.Environ())
-	if home, ok := lookupEnv(cmd.Env, "HOME"); ok {
-		cmd.Dir = home
-	}
+	cmd.Env = withPasswdFallback(mergeEnv(session.Environ()))
+	cmd.Dir = sessionWorkingDir(cmd.Env)
 
 	sc := &sessionCmd{cmd: cmd}
 

@@ -374,6 +374,85 @@ func readFullWithin(reader io.Reader, n int, timeout time.Duration) ([]byte, err
 	}
 }
 
+// A reverse forward must land on loopback even when the client asks for every
+// interface, which is exactly what IDEs do. Unrewritten, the library would hand
+// the wildcard to net.Listen and publish the listener on every pod interface.
+func TestReverseForwardBindsLoopbackOnly(t *testing.T) {
+	client := newSessionStack(t)
+
+	listener, err := client.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to request a reverse forward: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	_, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("unexpected forward address %q: %v", listener.Addr(), err)
+	}
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	// The forward has to work on loopback.
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", portStr), dialTimeout)
+	if err != nil {
+		t.Fatalf("expected the reverse forward to be reachable on loopback: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte("reversed")); err != nil {
+		t.Fatalf("failed to write through the reverse forward: %v", err)
+	}
+	echoed, err := readFullWithin(conn, len("reversed"), dialTimeout)
+	if err != nil {
+		t.Fatalf("failed to read back through the reverse forward: %v", err)
+	}
+	if string(echoed) != "reversed" {
+		t.Errorf("expected %q, got %q", "reversed", echoed)
+	}
+
+	// And it must not be anywhere else. Binding the same port on a routable
+	// address only succeeds if the server did not take the wildcard.
+	routable := routableIPv4(t)
+	probe, err := net.Listen("tcp", net.JoinHostPort(routable, portStr))
+	if err != nil {
+		t.Fatalf("port %s is occupied on %s, so the reverse forward bound more than "+
+			"loopback: %v", portStr, routable, err)
+	}
+	_ = probe.Close()
+}
+
+// routableIPv4 returns a non-loopback IPv4 address of this host, which is what
+// makes it possible to tell a loopback bind from a wildcard one.
+func routableIPv4(t *testing.T) string {
+	t.Helper()
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("cannot enumerate interface addresses: %v", err)
+	}
+
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() {
+			continue
+		}
+		if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+			return ipv4.String()
+		}
+	}
+
+	t.Skip("this host has no non-loopback IPv4 address to distinguish the bind")
+	return ""
+}
+
 func TestLocalPortForwardRejectsNonLoopbackDestination(t *testing.T) {
 	client := newSessionStack(t)
 

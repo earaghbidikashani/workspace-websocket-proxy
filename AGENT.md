@@ -77,12 +77,24 @@ Four invariants that are easy to break and must not be:
   relying on the window being small.
 
 Port forwarding is permitted only to loopback destinations, in both directions, so
-a session cannot become a proxy into the cluster network. Reverse forwards need
-care: the library hands the requested bind address straight to `net.Listen`, so an
-empty address would listen on every pod interface, and IDEs send exactly that.
-`forceLoopbackForward` rewrites wildcard binds before the library sees them, and
-it must stay wrapped around *both* `tcpip-forward` and `cancel-tcpip-forward`
-because the library keys its forward table on the joined address.
+a session cannot become a proxy into the cluster network.
+
+Reverse forwards (`forward.go`) do not use the library's `ForwardedTCPHandler`,
+and the reason is subtle enough to be worth stating. Two addresses are involved
+and they must differ:
+
+- the **listener** must bind loopback, or a forward is reachable from outside the
+  pod. The library hands the requested address straight to `net.Listen`, so the
+  empty address IDEs send becomes `":port"`.
+- the **`forwarded-tcpip` channel** must report the address the *client asked
+  for*. RFC 4254 §7.2 specifies the address from the request, and clients match
+  incoming channels against exactly what they registered.
+
+The library derives both from one field, so rewriting the request payload cannot
+satisfy both: it binds correctly and then every forwarded connection is rejected
+by the client, which presents as the forward accepting connections and instantly
+resetting them. `loopbackForwardHandler` keeps the two apart, and keys its
+forward table on the requested address because that is what a cancel names.
 
 ### Nothing here starts the SSH server
 
@@ -101,7 +113,8 @@ in the workspace image build.
 Keep the dependency surfaces separate. `ws-proxy` must not import
 `internal/sshserver`, so the sidecar image carries none of the SSH dependencies
 (`gliderlabs/ssh`, `creack/pty`, `pkg/sftp`) and a CVE in them does not flag the
-sidecar.
+sidecar. `internal/proxy/deps_test.go` enforces this with `go list -deps`, so an
+import added through `internal/proxy` is caught too.
 
 ### Key files
 
@@ -114,8 +127,10 @@ sidecar.
 - `internal/proxy/session.go` — session lifecycle
 - `internal/sshserver/server.go` — SSH handlers: session, SFTP, port-forward callbacks, disconnect cleanup
 - `internal/sshserver/config.go` — configuration and the loopback-bind guard
+- `internal/sshserver/forward.go` — reverse port forwarding, loopback-pinned
 - `internal/sshserver/shell.go` — shell selection, command assembly, environment merging
 - `internal/sshserver/hostkey.go` — host key load, generate and persist
+- `internal/proxy/deps_test.go` — pins the sidecar's dependency surface
 
 `/health` reports on the proxy process alone and never dials the target. Keep it
 that way: pod readiness gates every port on the pod, so a readiness probe that

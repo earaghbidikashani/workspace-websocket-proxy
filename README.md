@@ -107,6 +107,10 @@ Persist the host key on storage that survives a container restart, otherwise eve
 
 `SSH_MAX_SESSIONS` bounds shell and exec channels only. SFTP subsystems and port forwards do not claim a slot, so concurrent transfers and forwarded connections are unbounded, which is acceptable for a single-tenant workspace pod but worth knowing before relying on the number.
 
+Reverse forwards always bind loopback, including when the client requests every interface, which is what IDEs do. A request naming a specific routable address is refused rather than moved.
+
+Session variables come from the server's own environment with the client's overlaid on top. When that leaves `HOME`, `USER` or `LOGNAME` unset, they are filled from the passwd entry, because a launcher need not provide them: supervisord does not set them for a program started under `user=`.
+
 When a client disconnects, the session's process group is sent `SIGHUP` and then `SIGKILL` after a short grace period. Signalling the group rather than the shell alone means processes the session backgrounded go with it. On `SIGTERM` the server drains active sessions for up to twenty seconds before severing what remains, so a rollout does not cut a command or an SFTP write mid-write.
 
 ## Development

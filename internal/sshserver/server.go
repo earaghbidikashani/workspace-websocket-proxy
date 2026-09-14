@@ -30,10 +30,16 @@ import (
 )
 
 const (
+	// exitCodeGeneralError is the status reported when the server itself fails
+	// before or around the command, rather than the command exiting non-zero.
 	exitCodeGeneralError = 1
 
+	// exitCodeCommandNotExecutable mirrors the shell convention for a command
+	// that could not be executed at all.
 	exitCodeCommandNotExecutable = 127
 
+	// signalExitCodeBase is the shell convention for reporting a process killed
+	// by signal N as exit status 128+N.
 	signalExitCodeBase = 128
 
 	hostKeyDirMode  = 0o700
@@ -43,15 +49,26 @@ const (
 	shellSh   = "/bin/sh"
 )
 
-// Server is the SSH server that terminates remote IDE sessions.
+// Server is the SSH server that terminates remote IDE sessions. It runs inside
+// the workspace container and listens on loopback, where the proxy sidecar
+// reaches it over the pod's shared network namespace.
 type Server struct {
-	config   *Config
-	logger   logr.Logger
-	ssh      *ssh.Server
+	config *Config
+	logger logr.Logger
+
+	// ssh is the underlying gliderlabs server, configured in New.
+	ssh *ssh.Server
+
+	// sessions counts in-flight shell and exec channels against MaxSessions.
 	sessions atomic.Int64
 }
 
 // New validates the configuration and builds the SSH server.
+//
+// No authentication handler is registered, so gliderlabs accepts every client.
+// That is deliberate: the ingress validates a short-lived token before any byte
+// reaches the proxy, and the loopback bind that Config.validate enforces is what
+// keeps the socket unreachable from outside the pod.
 func New(config *Config, logger logr.Logger) (*Server, error) {
 	if err := config.validate(); err != nil {
 		return nil, err
@@ -99,7 +116,8 @@ func New(config *Config, logger logr.Logger) (*Server, error) {
 	return s, nil
 }
 
-// ListenAndServe starts the SSH server and blocks until it stops.
+// ListenAndServe starts the SSH server and blocks until it stops, returning
+// ssh.ErrServerClosed after a Shutdown.
 func (s *Server) ListenAndServe() error {
 	s.logger.Info("Starting SSH server",
 		"addr", s.config.ListenAddr,
@@ -110,11 +128,17 @@ func (s *Server) ListenAndServe() error {
 	return s.ssh.ListenAndServe()
 }
 
-// Shutdown stops accepting new connections.
+// Shutdown closes the listener and terminates active connections immediately.
+// The context is accepted for interface symmetry with the proxy server and is
+// not yet honoured as a drain deadline.
 func (s *Server) Shutdown(_ context.Context) error {
 	return s.ssh.Close()
 }
 
+// allowLocalForward authorizes a "direct-tcpip" channel, the forward a client
+// opens to reach a port inside the pod (ssh -L). Only loopback destinations are
+// permitted, so a session cannot use the pod as a jump host into the cluster
+// network.
 func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool {
 	if !isLoopback(host) {
 		s.logger.Info("Rejected local forward to non-loopback destination", "host", host, "port", port)
@@ -124,6 +148,11 @@ func (s *Server) allowLocalForward(_ ssh.Context, host string, port uint32) bool
 	return true
 }
 
+// allowReverseForward authorizes a "tcpip-forward" request, where the client
+// asks the server to listen on a port and relay inbound connections back over
+// the session (ssh -R). IDEs use this for feature forwarding. Only loopback
+// bind addresses are permitted so the listener is not reachable from outside
+// the pod.
 func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort uint32) bool {
 	if bindHost == "" {
 		s.logger.V(1).Info("Accepted reverse forward on implicit loopback bind", "port", bindPort)
@@ -138,6 +167,10 @@ func (s *Server) allowReverseForward(_ ssh.Context, bindHost string, bindPort ui
 	return true
 }
 
+// handleSession services one "session" channel: the interactive shell or exec
+// command an IDE runs. It claims a session slot, resolves the shell and
+// environment, then dispatches to the PTY or non-PTY path depending on whether
+// the client requested a terminal.
 func (s *Server) handleSession(session ssh.Session) {
 	if !s.acquireSession() {
 		s.logger.Info("Rejecting session: at capacity", "maxSessions", s.config.MaxSessions)
@@ -166,6 +199,9 @@ func (s *Server) handleSession(session ssh.Session) {
 	s.runWithoutPty(session, cmd, logger)
 }
 
+// acquireSession claims one of the MaxSessions slots, reporting false when the
+// server is already at capacity. A non-positive MaxSessions disables the limit.
+// The count covers shell and exec channels only, not SFTP or port forwards.
 func (s *Server) acquireSession() bool {
 	if s.config.MaxSessions <= 0 {
 		return true
@@ -177,6 +213,7 @@ func (s *Server) acquireSession() bool {
 	return true
 }
 
+// releaseSession returns a slot claimed by acquireSession.
 func (s *Server) releaseSession() {
 	if s.config.MaxSessions <= 0 {
 		return
@@ -184,6 +221,20 @@ func (s *Server) releaseSession() {
 	s.sessions.Add(-1)
 }
 
+// runWithPty runs the command on a pseudo-terminal, the path an interactive
+// shell takes.
+//
+// The pty master is a single file descriptor carrying both directions, so there
+// is one pipe rather than the three of runWithoutPty: a goroutine copies client
+// input into the master while the caller's goroutine copies program output back
+// out. The outbound copy returns when the child exits and the kernel reports EIO
+// on the master, which is what ends the session.
+//
+// Teardown order matters. watchWindowSize holds the same *os.File and calls
+// setWinsize on it, and os.File reference-counts Read and Write but not Fd, so
+// closing the master while a resize is in flight is a use-after-close that the
+// race detector reports. The resize goroutine is therefore stopped and joined
+// before the master is closed.
 func (s *Server) runWithPty(
 	session ssh.Session,
 	cmd *exec.Cmd,
@@ -217,6 +268,11 @@ func (s *Server) runWithPty(
 	s.finish(session, cmd, logger)
 }
 
+// watchWindowSize applies terminal resizes the client sends mid-session, so a
+// full-screen program redraws correctly when the IDE's terminal pane changes
+// size. It returns a channel the caller closes to stop the goroutine and a
+// second channel the goroutine closes once it has returned; the caller must
+// wait on the latter before closing f.
 func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan struct{}, done chan struct{}) {
 	stop = make(chan struct{})
 	done = make(chan struct{})
@@ -239,6 +295,14 @@ func (s *Server) watchWindowSize(f *os.File, winCh <-chan ssh.Window) (stop chan
 	return stop, done
 }
 
+// runWithoutPty runs the command with ordinary pipes, the path an exec command
+// takes when the client requested no terminal. This is how IDEs bootstrap their
+// server component, so stdout and stderr stay separate and the exit status is
+// propagated verbatim.
+//
+// Stdout and stderr are wired straight to the session. Stdin needs a pipe
+// because the copy has to be closed once the client stops sending: a program
+// reading to EOF would otherwise block forever.
 func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
 	cmd.Stdout = session
 	cmd.Stderr = session.Stderr()
@@ -265,12 +329,18 @@ func (s *Server) runWithoutPty(session ssh.Session, cmd *exec.Cmd, logger logr.L
 	s.finish(session, cmd, logger)
 }
 
+// finish reaps the child and reports its status to the client as the channel's
+// exit-status request.
 func (s *Server) finish(session ssh.Session, cmd *exec.Cmd, logger logr.Logger) {
 	code := exitCode(cmd.Wait())
 	logger.Info("Session closed", "exitCode", code)
 	_ = session.Exit(code)
 }
 
+// exitCode translates the error from exec.Cmd.Wait into the status an SSH
+// client expects, reporting a signalled process as 128+signal. IDEs branch on
+// this value while bootstrapping, so a swallowed status surfaces as a
+// connection failure that is hard to diagnose from the client.
 func exitCode(err error) int {
 	if err == nil {
 		return 0
@@ -291,6 +361,11 @@ func exitCode(err error) int {
 	return exitCodeGeneralError
 }
 
+// handleSFTP serves the "sftp" subsystem, which is how an IDE browses and
+// transfers files. The session channel is handed to the SFTP server as its
+// transport, so the protocol runs inside the same SSH connection as the shell.
+// Requests are served with the process's own credentials; there is no
+// chroot, so reachable paths are whatever the container's user can open.
 func (s *Server) handleSFTP(session ssh.Session) {
 	logger := s.logger.WithValues("remoteAddr", session.RemoteAddr().String())
 	logger.Info("SFTP session opened")
@@ -313,6 +388,10 @@ func (s *Server) handleSFTP(session ssh.Session) {
 	_ = session.Exit(0)
 }
 
+// buildShellCommand assembles the command for a session: the shell on its own
+// for an interactive login, or the shell with -c for an exec request. The
+// command always goes through a shell so that quoting, pipes and redirection in
+// what the client sent behave the way the client expects.
 func buildShellCommand(shell string, loginShell bool, rawCmd string) *exec.Cmd {
 	if strings.TrimSpace(rawCmd) == "" {
 		if loginShell {
@@ -327,6 +406,9 @@ func buildShellCommand(shell string, loginShell bool, rawCmd string) *exec.Cmd {
 	return exec.Command(shell, "-c", rawCmd)
 }
 
+// resolveShell picks the shell to run, preferring $SHELL and falling back to
+// bash then sh. Workspace images vary, so the candidates are probed rather than
+// assumed.
 func resolveShell() string {
 	candidates := []string{os.Getenv("SHELL"), shellBash, shellSh}
 	for _, candidate := range candidates {
@@ -340,6 +422,10 @@ func resolveShell() string {
 	return shellSh
 }
 
+// mergeEnv combines the server process's environment with the variables the
+// client sent, letting the client win on conflicts. The process environment is
+// the base because it carries the image's own setup, such as PATH and the
+// virtualenv, that the workspace needs.
 func mergeEnv(sessionEnv []string) []string {
 	merged := map[string]string{}
 	for _, entry := range append(os.Environ(), sessionEnv...) {
@@ -355,6 +441,8 @@ func mergeEnv(sessionEnv []string) []string {
 	return out
 }
 
+// lookupEnv reads a variable out of an environment slice, for the merged
+// environment that has not been applied to the process.
 func lookupEnv(env []string, key string) (string, bool) {
 	prefix := key + "="
 	for _, entry := range env {
@@ -365,6 +453,11 @@ func lookupEnv(env []string, key string) (string, bool) {
 	return "", false
 }
 
+// loadOrCreateHostKey returns the host key at path, generating and persisting
+// one on first use, and reports whether it generated it. Persisting matters:
+// with an ephemeral key the fingerprint changes on every restart and clients
+// learn to disable host-key checking. A key that exists but cannot be parsed is
+// an error rather than a cause to overwrite it.
 func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err error) {
 	pemBytes, readErr := os.ReadFile(path)
 	switch {
@@ -397,6 +490,7 @@ func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err er
 	return parsed, true, nil
 }
 
+// generateHostKeyPEM creates a new ed25519 host key as PKCS#8 PEM.
 func generateHostKeyPEM() ([]byte, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -411,6 +505,8 @@ func generateHostKeyPEM() ([]byte, error) {
 	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }
 
+// setWinsize tells the pty its dimensions, which is what makes full-screen
+// programs in the session lay out correctly.
 func setWinsize(f *os.File, w, h int) {
 	winsize := struct{ h, w, x, y uint16 }{uint16(h), uint16(w), 0, 0}
 	_, _, _ = syscall.Syscall(

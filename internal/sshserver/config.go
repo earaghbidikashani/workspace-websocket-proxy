@@ -17,6 +17,7 @@ import (
 )
 
 const (
+	// defaultPort is the loopback port the proxy sidecar dials by default.
 	defaultPort = 2222
 
 	defaultMaxSessions = 10
@@ -28,20 +29,36 @@ const (
 	localhostHost = "localhost"
 )
 
+// ephemeralPathPrefixes are locations a container restart wipes, used to warn
+// when the host key would not survive a restart.
 var ephemeralPathPrefixes = []string{"/tmp/", "/var/tmp/", "/run/", "/dev/shm/"}
 
 // Config holds the SSH server configuration.
 type Config struct {
+	// ListenAddr is the address the SSH server listens on. It must be a
+	// loopback address unless AllowNonLoopback is set.
 	ListenAddr string
 
+	// HostKeyPath is where the ed25519 host key is persisted. It should be on
+	// storage that survives a container restart, otherwise the fingerprint
+	// changes every time and clients learn to disable host-key checking.
 	HostKeyPath string
 
+	// IdleTimeout closes a connection after this long without I/O. Zero
+	// disables the timeout.
 	IdleTimeout time.Duration
 
+	// MaxSessions caps concurrent shell and exec channels. Zero or negative
+	// disables the cap. SFTP subsystems and port forwards are not counted.
 	MaxSessions int
 
+	// LoginShell runs the session shell with -l, so it reads the user's login
+	// profile.
 	LoginShell bool
 
+	// AllowNonLoopback lifts the loopback restriction on ListenAddr. Only set
+	// it when an authentication layer equivalent to the ingress is provably in
+	// front of the server.
 	AllowNonLoopback bool
 }
 
@@ -57,6 +74,9 @@ func LoadConfig() *Config {
 	}
 }
 
+// defaultHostKeyPath places the host key under the user's home directory, which
+// in a workspace is a persistent volume. It returns an empty string when no home
+// directory can be determined, which validate turns into an actionable error.
 func defaultHostKeyPath() string {
 	home := homeDir()
 	if home == "" {
@@ -65,6 +85,9 @@ func defaultHostKeyPath() string {
 	return filepath.Join(home, hostKeyDirName, hostKeyFileName)
 }
 
+// homeDir resolves the user's home directory, falling back to the passwd entry
+// when HOME is unset. os.UserHomeDir consults only HOME on Unix, and a process
+// started by a supervisor may not inherit it.
 func homeDir() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		return home
@@ -75,6 +98,10 @@ func homeDir() string {
 	return ""
 }
 
+// validate rejects a configuration the server must not run with. The loopback
+// check is the important one: this server performs no SSH authentication, so a
+// non-loopback bind would expose an unauthenticated shell to the cluster
+// network.
 func (c *Config) validate() error {
 	host, port, err := net.SplitHostPort(c.ListenAddr)
 	if err != nil {
@@ -114,6 +141,8 @@ func (c *Config) validate() error {
 	return nil
 }
 
+// hasEphemeralHostKeyPath reports whether the host key lives somewhere that a
+// container restart wipes, so the server can warn about it at startup.
 func (c *Config) hasEphemeralHostKeyPath() bool {
 	for _, prefix := range ephemeralPathPrefixes {
 		if strings.HasPrefix(c.HostKeyPath, prefix) {
@@ -123,6 +152,9 @@ func (c *Config) hasEphemeralHostKeyPath() bool {
 	return false
 }
 
+// isLoopback reports whether host names only the loopback interface. An empty
+// host and "*" are rejected because both mean every interface when passed to
+// net.Listen.
 func isLoopback(host string) bool {
 	if host == "" || host == "*" {
 		return false
@@ -136,6 +168,10 @@ func isLoopback(host string) bool {
 	}
 	return ip.IsLoopback()
 }
+
+// The getEnv helpers below all fall back to the default when the variable is
+// unset or empty, and the typed ones do the same when the value fails to parse,
+// so a malformed override degrades to the default rather than failing startup.
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {

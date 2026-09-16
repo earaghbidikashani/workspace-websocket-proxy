@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -42,6 +43,14 @@ type Server struct {
 	revalidator    Revalidator
 	logger         logr.Logger
 	httpServer     *http.Server
+
+	// targetHealth is written by the background prober and read by
+	// handleTargetHealth.
+	targetHealth *targetHealth
+
+	proberStop chan struct{}
+	proberDone chan struct{}
+	proberOnce sync.Once
 }
 
 // NewServer creates a new proxy Server.
@@ -52,6 +61,7 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 		sessionManager: NewSessionManager(config.MaxConnections),
 		revalidator:    &NoOpRevalidator{},
 		logger:         logger.WithName("server"),
+		targetHealth:   &targetHealth{},
 	}
 
 	mux := http.NewServeMux()
@@ -68,7 +78,7 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 	return s
 }
 
-// ListenAndServe starts the HTTP server.
+// ListenAndServe starts the target prober and the HTTP server.
 func (s *Server) ListenAndServe() error {
 	s.logger.Info("Starting WebSocket proxy",
 		"addr", s.config.ListenAddr,
@@ -77,12 +87,16 @@ func (s *Server) ListenAndServe() error {
 		"maxSessionDuration", s.config.MaxSessionDuration,
 		"pingInterval", s.config.PingInterval,
 		"pingTimeout", s.config.PingTimeout,
+		"targetHealthInterval", s.config.TargetHealthInterval,
 	)
+
+	s.startTargetProber()
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server and the target prober.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopTargetProber()
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -93,31 +107,33 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":"ok","activeConnections":%d}`, s.sessionManager.ActiveCount())
 }
 
-// handleTargetHealth reports whether the proxy can reach its target. It is for
-// alerting, not readiness: pod readiness gates every port on the pod, so a
-// readiness probe that failed because remote access was broken would also
-// withdraw port 8888 and take the web UI down with it.
-func (s *Server) handleTargetHealth(w http.ResponseWriter, r *http.Request) {
+// handleTargetHealth reports the last probe result. It is for alerting, not
+// readiness: pod readiness gates every port on the pod, so a readiness probe that
+// failed because remote access was broken would also withdraw port 8888 and take
+// the web UI down with it.
+//
+// It reports rather than probes, so that the load this endpoint puts on the target
+// is fixed by the probe interval instead of by how often it is called. It shares
+// an unauthenticated listener with the data path.
+func (s *Server) handleTargetHealth(w http.ResponseWriter, _ *http.Request) {
 	target := s.config.TargetAddr()
-
-	ctx, cancel := context.WithTimeout(r.Context(), targetHealthDialTimeout)
-	defer cancel()
-
-	if err := probeTarget(ctx, target, s.config.TargetHealthBannerPrefix); err != nil {
-		s.metrics.TargetReachable.Set(0)
-		s.logger.V(1).Info("Target health check failed", "target", target, "error", err.Error())
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, `{"status":"unreachable","target":%q,"error":%q}`, target, err.Error())
-		return
-	}
-
-	s.metrics.TargetReachable.Set(1)
+	result := s.targetHealth.snapshot()
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, `{"status":"ok","target":%q}`, target)
+
+	switch {
+	case !result.checked:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"unknown","target":%q}`, target)
+	case result.reachable:
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"status":"ok","target":%q,"checkedAt":%q}`,
+			target, result.at.UTC().Format(time.RFC3339))
+	default:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"unreachable","target":%q,"checkedAt":%q,"error":%q}`,
+			target, result.at.UTC().Format(time.RFC3339), result.err)
+	}
 }
 
 // probeTarget connects to addr and, when bannerPrefix is set, reads the

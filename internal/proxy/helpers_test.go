@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,15 +23,54 @@ func testLogger() logr.Logger {
 
 func testConfig() *Config {
 	return &Config{
-		ListenAddr:         ":0",
-		TargetHost:         "127.0.0.1",
-		TargetPort:         0,
-		MaxSessionDuration: 5 * time.Second,
-		PingInterval:       1 * time.Second,
-		PingTimeout:        2 * time.Second,
-		MaxConnections:     2,
-		ReadLimit:          65536,
+		ListenAddr:           ":0",
+		TargetHost:           "127.0.0.1",
+		TargetPort:           0,
+		MaxSessionDuration:   5 * time.Second,
+		PingInterval:         1 * time.Second,
+		PingTimeout:          2 * time.Second,
+		MaxConnections:       2,
+		ReadLimit:            65536,
+		TargetHealthInterval: 50 * time.Millisecond,
 	}
+}
+
+var (
+	connectionCountsMu sync.Mutex
+	connectionCounts   = map[string]int{}
+)
+
+// startCountingTCPServer starts a TCP server that counts accepted connections.
+func startCountingTCPServer(t *testing.T) (string, func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := listener.Addr().String()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			connectionCountsMu.Lock()
+			connectionCounts[addr]++
+			connectionCountsMu.Unlock()
+
+			_ = conn.Close()
+		}
+	}()
+
+	return addr, func() { _ = listener.Close() }
+}
+
+func connectionCount(addr string) int {
+	connectionCountsMu.Lock()
+	defer connectionCountsMu.Unlock()
+	return connectionCounts[addr]
 }
 
 // startBannerTCPServer starts a TCP server that writes banner on connect and

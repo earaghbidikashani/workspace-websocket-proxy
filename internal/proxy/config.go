@@ -18,6 +18,10 @@ import (
 // and the byte-copying data path stays protocol-agnostic.
 const defaultTargetHealthBannerPrefix = "SSH-2.0-"
 
+// defaultTargetHealthInterval is frequent enough for alerting to be timely and
+// infrequent enough that the connections are negligible to the target.
+const defaultTargetHealthInterval = 30 * time.Second
+
 // Config holds all configuration for the WebSocket proxy.
 type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
@@ -52,12 +56,17 @@ type Config struct {
 	// RevalidationEndpoint is the URL to call for re-validation (future use).
 	RevalidationEndpoint string
 
-	// TargetHealthBannerPrefix is the greeting /health/target expects the target
-	// to send on connect. A bare TCP dial succeeds off the listen backlog even
-	// when the target process is wedged and never calls accept, so the greeting
-	// is what proves the process is alive. Empty disables the check and reduces
-	// /health/target to a dial.
+	// TargetHealthBannerPrefix is the greeting the target health probe expects the
+	// target to send on connect. A bare TCP dial succeeds off the listen backlog
+	// even when the target process is wedged and never calls accept, so the
+	// greeting is what proves the process is alive. Empty disables the check and
+	// reduces the probe to a dial.
 	TargetHealthBannerPrefix string
+
+	// TargetHealthInterval is how often the background prober checks the target.
+	// It bounds the load the check places on the target, since /health/target
+	// reports the last result rather than probing when asked.
+	TargetHealthInterval time.Duration
 }
 
 // LoadConfig reads configuration from environment variables with sensible defaults.
@@ -77,6 +86,8 @@ func LoadConfig() (*Config, error) {
 
 		TargetHealthBannerPrefix: getEnvAllowEmpty(
 			"TARGET_HEALTH_BANNER_PREFIX", defaultTargetHealthBannerPrefix),
+		TargetHealthInterval: getDurationEnv(
+			"TARGET_HEALTH_INTERVAL", defaultTargetHealthInterval),
 	}
 
 	if config.TargetPort < 1 || config.TargetPort > 65535 {
@@ -92,6 +103,13 @@ func LoadConfig() (*Config, error) {
 
 	if config.ReadLimit < 1024 || config.ReadLimit > 10*1024*1024 {
 		return nil, fmt.Errorf("READ_LIMIT must be between 1024 and 10485760, got: %d", config.ReadLimit)
+	}
+
+	if config.TargetHealthInterval <= targetHealthDialTimeout {
+		return nil, fmt.Errorf(
+			"TARGET_HEALTH_INTERVAL (%s) must be greater than the probe timeout (%s)",
+			config.TargetHealthInterval, targetHealthDialTimeout,
+		)
 	}
 
 	return config, nil

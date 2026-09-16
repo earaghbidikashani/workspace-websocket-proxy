@@ -58,7 +58,7 @@ func NewMetrics() *Metrics {
 
 	targetReachable := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "ws_proxy_target_reachable",
-		Help: "Whether the last /health/target probe connected to the target and saw " +
+		Help: "Whether the most recent background probe connected to the target and saw " +
 			"its expected greeting (1) or failed (0). Does not verify that an SSH " +
 			"handshake would complete.",
 	})

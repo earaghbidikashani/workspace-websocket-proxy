@@ -86,11 +86,14 @@ A supervisor is required because the server has to be listening before any clien
 | `PING_INTERVAL` / `PING_TIMEOUT` | `30s` / `60s` | Keepalive and dead-peer detection |
 | `MAX_CONNECTIONS` | `10` | Concurrency cap, rejected with 429 and a `Retry-After` |
 | `READ_LIMIT` | `65536` | Maximum inbound message size |
-| `TARGET_HEALTH_BANNER_PREFIX` | `SSH-2.0-` | Greeting `/health/target` expects from the target. Empty disables the check. |
+| `TARGET_HEALTH_BANNER_PREFIX` | `SSH-2.0-` | Greeting the target health probe expects. Empty disables the check. |
+| `TARGET_HEALTH_INTERVAL` | `30s` | How often the background prober checks the target |
 
-Endpoints: `/health` reports on the proxy process only and is safe for a pod readiness probe. `/health/target` probes the target and is intended for alerting, not readiness, because pod readiness gates every port on the pod. `/metrics` serves Prometheus metrics.
+Endpoints: `/health` reports on the proxy process only and is safe for a pod readiness probe. `/health/target` reports target reachability and is intended for alerting, not readiness, because pod readiness gates every port on the pod. `/metrics` serves Prometheus metrics.
 
-`/health/target` connects and then reads the target's greeting rather than only dialing, because the kernel completes a TCP handshake from the listen backlog even when the target process is wedged and never accepts, so a dial alone reports a deadlocked server as healthy. Point `TARGET_HEALTH_BANNER_PREFIX` at whatever the target announces, or set it empty for a target that announces nothing.
+A background prober checks the target every `TARGET_HEALTH_INTERVAL` and publishes the result as `ws_proxy_target_reachable`. `/health/target` reports that last result and does not dial, so the load on the target is fixed by the interval rather than by how often the endpoint is called, and the metric is meaningful whether or not anything scrapes the endpoint. Before the first probe completes it reports `unknown`, which is distinct from `unreachable`.
+
+The probe connects and then reads the target's greeting rather than only dialing, because the kernel completes a TCP handshake from the listen backlog even when the target process is wedged and never accepts, so a dial alone reports a deadlocked server as healthy. Point `TARGET_HEALTH_BANNER_PREFIX` at whatever the target announces, or set it empty for a target that announces nothing.
 
 `remote-access-server`, from the environment, with `--port`, `--host-key` and `--login-shell` overriding:
 

@@ -6,6 +6,7 @@ Distributed under the terms of the MIT license
 package proxy
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -51,48 +52,29 @@ func TestHealthEndpointDoesNotDialTarget(t *testing.T) {
 }
 
 func TestTargetHealthEndpointReachable(t *testing.T) {
-	tcpAddr, cleanupTCP := startEchoTCPServer(t)
-	defer cleanupTCP()
+	addr, cleanup := startEchoTCPServer(t)
+	defer cleanup()
 
-	_, portStr, _ := net.SplitHostPort(tcpAddr)
-	port, _ := strconv.Atoi(portStr)
+	code, body, server := targetHealthStatus(t, addr, "")
 
-	config := testConfig()
-	config.TargetHost = "127.0.0.1"
-	config.TargetPort = port
-
-	server := NewServer(config, testLogger())
-
-	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
-	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", w.Code)
+	if code != http.StatusOK {
+		t.Errorf("expected status 200, got %d", code)
 	}
-	if !strings.Contains(w.Body.String(), "ok") {
-		t.Errorf("expected body to contain 'ok', got %s", w.Body.String())
+	if !strings.Contains(body, "ok") {
+		t.Errorf("expected body to contain 'ok', got %s", body)
 	}
 
 	assertMetricPresent(t, server, "ws_proxy_target_reachable 1")
 }
 
 func TestTargetHealthEndpointUnreachable(t *testing.T) {
-	config := testConfig()
-	config.TargetHost = "127.0.0.1"
-	config.TargetPort = 1
+	code, body, server := targetHealthStatus(t, "127.0.0.1:1", "")
 
-	server := NewServer(config, testLogger())
-
-	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
-	w := httptest.NewRecorder()
-	server.httpServer.Handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected status 503, got %d", w.Code)
+	if code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", code)
 	}
-	if !strings.Contains(w.Body.String(), "unreachable") {
-		t.Errorf("expected body to contain 'unreachable', got %s", w.Body.String())
+	if !strings.Contains(body, "unreachable") {
+		t.Errorf("expected body to contain 'unreachable', got %s", body)
 	}
 
 	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
@@ -112,6 +94,10 @@ func targetHealthStatus(t *testing.T, addr, bannerPrefix string) (int, string, *
 	config.TargetHealthBannerPrefix = bannerPrefix
 
 	server := NewServer(config, testLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), targetHealthDialTimeout)
+	defer cancel()
+	server.probeOnce(ctx)
 
 	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
 	w := httptest.NewRecorder()
@@ -176,6 +162,185 @@ func TestTargetHealthSkipsBannerWhenPrefixEmpty(t *testing.T) {
 	if code != http.StatusOK {
 		t.Errorf("expected status 200 with the banner check disabled, got %d (body %s)", code, body)
 	}
+}
+
+func TestTargetHealthReportsUnknownBeforeTheFirstProbe(t *testing.T) {
+	server := NewServer(testConfig(), testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+	w := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503 before any probe, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "unknown") {
+		t.Errorf("expected an unmeasured target to report unknown, got %s", w.Body.String())
+	}
+}
+
+func TestTargetHealthDoesNotDialWhenAsked(t *testing.T) {
+	addr, cleanup := startCountingTCPServer(t)
+	defer cleanup()
+
+	server := newServerForTarget(t, addr, "")
+
+	ctx, cancel := context.WithTimeout(context.Background(), targetHealthDialTimeout)
+	defer cancel()
+	server.probeOnce(ctx)
+
+	waitForConnectionCount(t, addr, 1)
+	before := connectionCount(addr)
+
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected the cached result to be served, got %d", w.Code)
+		}
+	}
+
+	if after := connectionCount(addr); after != before {
+		t.Errorf("requests opened %d connections to the target; the endpoint must report, not probe",
+			after-before)
+	}
+}
+
+func TestTargetProberSetsTheMetricWithoutAnyRequest(t *testing.T) {
+	addr, cleanup := startBannerTCPServer(t, "SSH-2.0-test\r\n")
+	defer cleanup()
+
+	_, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetPort = port
+	config.TargetHealthBannerPrefix = defaultTargetHealthBannerPrefix
+
+	server := NewServer(config, testLogger())
+	server.startTargetProber()
+	defer server.stopTargetProber()
+
+	waitForMetric(t, server, "ws_proxy_target_reachable 1")
+}
+
+func TestTargetProberReportsAnUnreachableTarget(t *testing.T) {
+	config := testConfig()
+	config.TargetPort = 1
+
+	server := NewServer(config, testLogger())
+	server.startTargetProber()
+	defer server.stopTargetProber()
+
+	body := waitForTargetStatus(t, server, "unreachable")
+	if !strings.Contains(body, "checkedAt") {
+		t.Errorf("expected the response to report when it was measured, got %s", body)
+	}
+	assertMetricPresent(t, server, "ws_proxy_target_reachable 0")
+}
+
+func TestTargetProberStopsOnShutdown(t *testing.T) {
+	addr, cleanup := startCountingTCPServer(t)
+	defer cleanup()
+
+	_, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetPort = port
+
+	server := NewServer(config, testLogger())
+	server.startTargetProber()
+
+	waitForMetric(t, server, "ws_proxy_target_reachable 1")
+	server.stopTargetProber()
+
+	settled := connectionCount(addr)
+	time.Sleep(4 * config.TargetHealthInterval)
+
+	if after := connectionCount(addr); after != settled {
+		t.Errorf("the prober kept running after shutdown: %d further connections", after-settled)
+	}
+}
+
+func TestStopTargetProberIsSafeWithoutStart(t *testing.T) {
+	NewServer(testConfig(), testLogger()).stopTargetProber()
+}
+
+func TestTargetProberToleratesNonPositiveInterval(t *testing.T) {
+	config := testConfig()
+	config.TargetHealthInterval = 0
+
+	server := NewServer(config, testLogger())
+	server.startTargetProber()
+	server.stopTargetProber()
+}
+
+func newServerForTarget(t *testing.T, addr, bannerPrefix string) *Server {
+	t.Helper()
+
+	_, portStr, _ := net.SplitHostPort(addr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = port
+	config.TargetHealthBannerPrefix = bannerPrefix
+
+	return NewServer(config, testLogger())
+}
+
+func waitForConnectionCount(t *testing.T, addr string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if connectionCount(addr) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for %d connections to %s, saw %d", want, addr, connectionCount(addr))
+}
+
+func waitForTargetStatus(t *testing.T, server *Server, want string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/health/target", nil)
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		if strings.Contains(w.Body.String(), want) {
+			return w.Body.String()
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for /health/target to report %q", want)
+	return ""
+}
+
+func waitForMetric(t *testing.T, server *Server, want string) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		w := httptest.NewRecorder()
+		server.httpServer.Handler.ServeHTTP(w, req)
+
+		if strings.Contains(w.Body.String(), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for metrics to contain %q", want)
 }
 
 func TestCapacityRejectionSetsRetryAfter(t *testing.T) {

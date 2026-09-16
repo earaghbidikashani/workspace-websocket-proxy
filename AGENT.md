@@ -138,12 +138,20 @@ failed because remote access was broken would also withdraw port 8888 and take
 the web UI down. `/health/target` is the endpoint that actually probes, and it is
 for alerting, not readiness.
 
-`/health/target` reads the target's greeting, not just a dial: the kernel
-completes a TCP handshake from the listen backlog even when the target process is
-wedged, so a dial alone reports a deadlocked server as healthy. The expected
-prefix is configuration (`TARGET_HEALTH_BANNER_PREFIX`, default `SSH-2.0-`), so
-the check compares a string and this package still contains no SSH protocol code.
-The e2e fixture sets it empty because its target is a socat echo server.
+The probe reads the target's greeting, not just a dial: the kernel completes a TCP
+handshake from the listen backlog even when the target process is wedged, so a
+dial alone reports a deadlocked server as healthy. The expected prefix is
+configuration (`TARGET_HEALTH_BANNER_PREFIX`, default `SSH-2.0-`), so the check
+compares a string and this package still contains no SSH protocol code. The e2e
+fixture sets it empty because its target is a socat echo server.
+
+Probing runs on a timer (`targethealth.go`) and `/health/target` reports the last
+result. Do not move the probe back into the handler. A gauge written only by a
+handler keeps its zero value on a healthy pod, because nothing calls the endpoint,
+so an alert on `ws_proxy_target_reachable` would fire everywhere. Reporting rather
+than probing also decouples the load on the target from the request rate, which
+matters because the endpoint is unauthenticated and shares a listener with the
+data path.
 
 ## Build & Test
 

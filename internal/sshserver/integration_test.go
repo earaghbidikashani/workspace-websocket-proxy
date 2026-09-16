@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,7 @@ func startProxy(t *testing.T, target string) string {
 		// The target here is the real SSH server, so exercise the banner check
 		// rather than the bare dial.
 		TargetHealthBannerPrefix: "SSH-2.0-",
+		TargetHealthInterval:     100 * time.Millisecond,
 	}
 
 	server := proxy.NewServer(config, testLogger())
@@ -465,16 +467,27 @@ func TestLocalPortForwardRejectsNonLoopbackDestination(t *testing.T) {
 func TestProxyTargetHealthReflectsSSHServer(t *testing.T) {
 	proxyAddr := startProxy(t, startSSHServer(t))
 
-	resp, err := http.Get(fmt.Sprintf("http://%s/health/target", proxyAddr))
-	if err != nil {
-		t.Fatalf("failed to request target health: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	url := fmt.Sprintf("http://%s/health/target", proxyAddr)
 
-	if resp.StatusCode != http.StatusOK {
+	deadline := time.Now().Add(startupTimeout)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("failed to request target health: %v", err)
+		}
 		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("expected status 200 with the SSH server running, got %d (%s)", resp.StatusCode, body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return
+		}
+		if !strings.Contains(string(body), "unknown") {
+			t.Fatalf("expected the probe to reach the SSH server, got %d (%s)", resp.StatusCode, body)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+
+	t.Fatalf("the background prober never reported the SSH server reachable")
 }
 
 func newEchoBackend(t *testing.T) string {

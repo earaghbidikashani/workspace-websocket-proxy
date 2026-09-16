@@ -37,6 +37,29 @@ func TestConfigDefaults(t *testing.T) {
 	if config.TargetHealthBannerPrefix != "SSH-2.0-" {
 		t.Errorf("expected SSH-2.0-, got %q", config.TargetHealthBannerPrefix)
 	}
+	if config.TargetHealthInterval != defaultTargetHealthInterval {
+		t.Errorf("expected %s, got %s", defaultTargetHealthInterval, config.TargetHealthInterval)
+	}
+}
+
+func TestConfigRejectsTargetHealthIntervalBelowProbeTimeout(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_INTERVAL", "1s")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an interval shorter than the probe timeout to be rejected")
+	}
+}
+
+func TestConfigAcceptsTargetHealthInterval(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_INTERVAL", "5m")
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := 5 * time.Minute; config.TargetHealthInterval != want {
+		t.Errorf("expected %s, got %s", want, config.TargetHealthInterval)
+	}
 }
 
 // An explicitly empty value must disable the banner check rather than fall back

@@ -180,35 +180,44 @@ func (c *Config) hasEphemeralHostKeyPath() bool {
 // directory, resolving through the nearest existing ancestor because the key's
 // directory is created after this runs.
 func isOnRootDevice(path string) bool {
-	rootDevice, ok := deviceOf(rootPath)
+	rootInfo, err := os.Stat(rootPath)
+	if err != nil {
+		return false
+	}
+
+	pathInfo, ok := statNearestAncestor(path)
 	if !ok {
 		return false
 	}
 
+	return onSameDevice(pathInfo, rootInfo)
+}
+
+// statNearestAncestor walks up from path until it finds something that exists.
+func statNearestAncestor(path string) (os.FileInfo, bool) {
 	for {
-		if device, found := deviceOf(path); found {
-			return device == rootDevice
+		if info, err := os.Stat(path); err == nil {
+			return info, true
 		}
 
 		parent := filepath.Dir(path)
 		if parent == path {
-			return false
+			return nil, false
 		}
 		path = parent
 	}
 }
 
-func deviceOf(path string) (device uint64, ok bool) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, false
+// onSameDevice compares the device identifiers directly rather than widening
+// them, because the field is uint64 on Linux and int32 on Darwin, so any
+// conversion is redundant on one of them.
+func onSameDevice(a, b os.FileInfo) bool {
+	aStat, aOK := a.Sys().(*syscall.Stat_t)
+	bStat, bOK := b.Sys().(*syscall.Stat_t)
+	if !aOK || !bOK {
+		return false
 	}
-
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, false
-	}
-	return uint64(stat.Dev), true
+	return aStat.Dev == bStat.Dev
 }
 
 // isLoopback reports whether host names only the loopback interface. An empty

@@ -78,6 +78,8 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ inputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}
+          cache-to: type=gha,mode=max,scope=${{ env.IMAGE_NAME }}
 
       - name: Build and push the remote access server image
         uses: docker/build-push-action@v6
@@ -94,3 +96,5 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ inputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ env.SSH_IMAGE_NAME }}
+          cache-to: type=gha,mode=max,scope=${{ env.SSH_IMAGE_NAME }}

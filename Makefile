@@ -16,6 +16,11 @@ ifeq ($(CONTAINER_TOOL),finch)
   BUILD_OPTS := $(shell if [ -f /etc/os-release ]; then echo "--network host"; else echo ""; fi)
 endif
 
+# Forwarded into image builds. The Dockerfiles leave it unset so CI uses the
+# module proxy; a developer whose network cannot reach proxy.golang.org exports
+# GOPROXY=direct and it is carried through.
+BUILD_OPTS += --build-arg GOPROXY=$(GOPROXY)
+
 # Binary names. ws-proxy runs as the workspace sidecar; remote-access-server is
 # embedded in the workspace image and started there.
 BINARY := ws-proxy

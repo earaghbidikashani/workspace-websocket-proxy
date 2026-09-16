@@ -1,30 +1,38 @@
-# Build stage
-FROM golang:1.26 AS builder
+# syntax=docker/dockerfile:1
+
+# Pinned to the builder's own architecture so the toolchain runs natively and
+# cross-compiles to the target, rather than the whole build running under QEMU.
+# The code is pure Go with cgo disabled, so cross-compiling costs nothing.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
-# Bypass Go proxy due to corporate network issues
-ENV GOPROXY=direct
+# Unset by default so the build uses the module proxy. Forwarded from the
+# developer's environment by the Makefile, since a network that cannot reach
+# proxy.golang.org needs GOPROXY=direct and a build arg is the only way in.
+ARG GOPROXY
 
-# Set working directory
 WORKDIR /workspace
 
-# Copy go.mod and go.sum first to leverage Docker cache
-COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=bind,source=go.mod,target=go.mod \
+    --mount=type=bind,source=go.sum,target=go.sum \
+    --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Copy the source code
-COPY internal/ internal/
-COPY cmd/ cmd/
-
-# Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -tags osusergo,netgo -a -o ws-proxy ./cmd/ws-proxy
+# The source is bind mounted rather than copied, so the output has to land outside
+# the read-only mount. osusergo and netgo keep os/user and the resolver on their
+# pure Go implementations whatever CGO_ENABLED is.
+RUN --mount=type=bind,target=. \
+    --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -tags osusergo,netgo -trimpath -ldflags="-s -w" \
+    -o /out/ws-proxy ./cmd/ws-proxy
 
 # Use distroless as minimal base image to package the binary
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
-COPY --from=builder /workspace/ws-proxy /ws-proxy
+COPY --from=builder /out/ws-proxy /ws-proxy
 USER 65532:65532
 
 # Expose proxy port

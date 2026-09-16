@@ -124,8 +124,17 @@ make test          # unit and integration tests, race detector on
 make lint
 make docker-build      # the sidecar image
 make docker-build-ssh  # the remote access server image
+make verify-static     # assert both binaries are statically linked
+make verify-carrier-image  # assert a consumer can COPY --from and run the binary
 make test-e2e          # Kind-based end-to-end tests
 ```
+
+Both binaries are built with `CGO_ENABLED=0` and `-tags osusergo,netgo` so they
+stay statically linked. That matters because the remote access server is copied
+into a workspace image that may be built on any distribution, and `os/user`, which
+this code calls to resolve the home directory, links against libc when cgo is
+enabled. `make verify-carrier-image` proves the point by extracting the binary into
+both a glibc and a musl base and running it.
 
 `internal/sshserver` carries an integration test that drives a real SSH session through a real proxy over a WebSocket, in process, with no cluster and no `ssh` or `websocat` binaries.
 

@@ -19,7 +19,7 @@ COPY cmd/ cmd/
 
 # Build
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -a -o remote-access-server ./cmd/remote-access-server
+    go build -tags osusergo,netgo -a -o remote-access-server ./cmd/remote-access-server
 
 # The remote access server runs inside the workspace container, not as a
 # container of its own: it spawns the user's shell, so it must share that

@@ -18,7 +18,8 @@ COPY internal/ internal/
 COPY cmd/ cmd/
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ws-proxy ./cmd/ws-proxy
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -tags osusergo,netgo -a -o ws-proxy ./cmd/ws-proxy
 
 # Use distroless as minimal base image to package the binary
 FROM gcr.io/distroless/static:nonroot

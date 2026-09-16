@@ -116,6 +116,22 @@ Keep the dependency surfaces separate. `ws-proxy` must not import
 sidecar. `internal/proxy/deps_test.go` enforces this with `go list -deps`, so an
 import added through `internal/proxy` is caught too.
 
+Both binaries must stay statically linked, because the carrier image ships no C
+library and a workspace image may be built on any distribution. Two things keep
+that true, and both are needed:
+
+- `CGO_ENABLED=0` on every build path, asserted by `make verify-static`.
+- `-tags osusergo,netgo` (`GO_BUILD_TAGS`), because `CGO_ENABLED` defaults to `1`
+  and `os/user` links `getpwuid_r` when cgo is on. `user.Current()` is reached
+  from `homeDir` and `withPasswdFallback`, so this package would otherwise pull in
+  libc. The tags are applied to `go vet` and `go test` as well, so tests exercise
+  the implementation that ships.
+
+`make verify-carrier-image` builds `test/carrier/Dockerfile` against a glibc and a
+musl base, extracting the binary with `COPY --from` and running it. Only the musl
+base catches a linking regression. That target is the sole place the carrier
+image's contract is exercised.
+
 ### Key files
 
 - `cmd/ws-proxy/main.go` — sidecar entry point, `--healthcheck` mode, graceful shutdown

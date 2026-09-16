@@ -21,6 +21,12 @@ endif
 BINARY := ws-proxy
 SSH_BINARY := remote-access-server
 
+# osusergo and netgo select the pure Go implementations of os/user and the DNS
+# resolver whatever CGO_ENABLED happens to be. Without them a build that lost
+# CGO_ENABLED=0 would link os/user against the host's libc, and the binary would
+# then fail to run in a workspace image built on a different one.
+GO_BUILD_TAGS := -tags osusergo,netgo
+
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
@@ -29,7 +35,7 @@ SHELL = /usr/bin/env bash -o pipefail
 all: build
 
 .PHONY: release
-release: build lint test ## Run all checks required before PR submission.
+release: build verify-static lint test ## Run all checks required before PR submission.
 
 ##@ General
 
@@ -50,15 +56,15 @@ fmt: ## Run go fmt against code.
 
 .PHONY: vet
 vet: ## Run go vet against code.
-	go vet ./...
+	go vet $(GO_BUILD_TAGS) ./...
 
 .PHONY: test
 test: fmt vet ## Run unit tests.
-	go test -race -coverprofile=coverage.out ./internal/...
+	go test $(GO_BUILD_TAGS) -race -coverprofile=coverage.out ./internal/...
 
 .PHONY: test-verbose
 test-verbose: fmt vet ## Run unit tests with verbose output.
-	go test -race -v -coverprofile=coverage.out ./internal/...
+	go test $(GO_BUILD_TAGS) -race -v -coverprofile=coverage.out ./internal/...
 
 .PHONY: lint
 lint: ## Run golangci-lint linter.
@@ -72,12 +78,31 @@ lint-fix: ## Run golangci-lint linter and perform fixes.
 
 .PHONY: build
 build: fmt vet ## Build both binaries.
-	CGO_ENABLED=0 go build -a -o bin/$(BINARY) ./cmd/ws-proxy
-	CGO_ENABLED=0 go build -a -o bin/$(SSH_BINARY) ./cmd/$(SSH_BINARY)
+	CGO_ENABLED=0 go build $(GO_BUILD_TAGS) -a -o bin/$(BINARY) ./cmd/ws-proxy
+	CGO_ENABLED=0 go build $(GO_BUILD_TAGS) -a -o bin/$(SSH_BINARY) ./cmd/$(SSH_BINARY)
 
 .PHONY: run
 run: build ## Run locally (for development).
 	./bin/$(BINARY)
+
+.PHONY: verify-static
+verify-static: build ## Assert both binaries are statically linked. Skipped where ldd is unavailable.
+	@if ! command -v ldd >/dev/null 2>&1; then \
+		echo "verify-static: ldd unavailable, skipping"; \
+	else \
+		for binary in $(BINARY) $(SSH_BINARY); do \
+			out=$$(ldd bin/$$binary 2>&1 || true); \
+			case "$$out" in \
+				*"not a dynamic executable"*|*"statically linked"*) \
+					echo "verify-static: bin/$$binary is static" ;; \
+				*) \
+					echo "verify-static: bin/$$binary is dynamically linked, so it will not run"; \
+					echo "  in a workspace image built on a different C library:"; \
+					echo "$$out"; \
+					exit 1 ;; \
+			esac; \
+		done; \
+	fi
 
 ##@ Container
 
@@ -88,6 +113,19 @@ docker-build: ## Build the sidecar container image.
 .PHONY: docker-build-ssh
 docker-build-ssh: ## Build the remote access server image, a carrier for the binary rather than a runnable service.
 	$(CONTAINER_TOOL) build $(BUILD_OPTS) -t $(SSH_IMG) -f images/$(SSH_BINARY)/Dockerfile .
+
+CARRIER_CONSUMER_BASES ?= debian:bookworm-slim alpine:3.20
+
+.PHONY: verify-carrier-image
+verify-carrier-image: docker-build-ssh ## Verify a consumer can COPY --from the remote access server image and run the binary.
+	@for base in $(CARRIER_CONSUMER_BASES); do \
+		echo "verify-carrier-image: consuming $(SSH_IMG) from $$base"; \
+		$(CONTAINER_TOOL) build $(BUILD_OPTS) \
+			-f test/carrier/Dockerfile \
+			--build-arg CARRIER_IMAGE=$(SSH_IMG) \
+			--build-arg BASE_IMAGE=$$base \
+			-t jupyter-k8s-remote-access-consumer:$${base%%:*} . || exit 1; \
+	done
 
 .PHONY: docker-push
 docker-push: ## Push container image.

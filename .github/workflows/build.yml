@@ -22,8 +22,14 @@ jobs:
       - name: Build binary
         run: make build
 
+      - name: Verify the binaries are statically linked
+        run: make verify-static
+
       - name: Build Docker image
         run: make docker-build CONTAINER_TOOL=docker
 
       - name: Build remote access server image
         run: make docker-build-ssh CONTAINER_TOOL=docker
+
+      - name: Verify a consumer can extract and run the binary
+        run: make verify-carrier-image CONTAINER_TOOL=docker

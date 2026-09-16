@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # Pinned to the builder's own architecture so the toolchain runs natively and
 # cross-compiles to the target, rather than the whole build running under QEMU.
 # The code is pure Go with cgo disabled, so cross-compiling costs nothing.

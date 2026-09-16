@@ -40,6 +40,10 @@ spec:
         # server, so it sends no SSH greeting for /health/target to check.
         - name: TARGET_HEALTH_BANNER_PREFIX
           value: ""
+        # The target installs socat before it listens, so probe often enough that
+        # the reported result converges quickly once it does.
+        - name: TARGET_HEALTH_INTERVAL
+          value: "5s"
       ports:
         - containerPort: 8080
       readinessProbe:

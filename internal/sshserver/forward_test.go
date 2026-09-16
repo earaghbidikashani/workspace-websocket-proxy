@@ -154,6 +154,55 @@ func TestForwardHandlerCancelsUsingTheRequestedAddress(t *testing.T) {
 	}
 }
 
+func TestAcceptLoopRemovesItsOwnForward(t *testing.T) {
+	handler, srv := testForwardHandler(t)
+
+	listener, port, ok := handler.openForward(nil, srv, request(loopbackIPv4, 0))
+	if !ok {
+		t.Fatal("expected the forward to be accepted")
+	}
+	key := forwardKey(loopbackIPv4, port)
+
+	_ = listener.Close()
+	handler.acceptLoop(nil, listener, loopbackIPv4, port, key)
+
+	if handler.listenerFor(loopbackIPv4, port) != nil {
+		t.Error("expected the accept loop to remove its own forward")
+	}
+}
+
+func TestAcceptLoopDoesNotEvictAReplacementForward(t *testing.T) {
+	handler, srv := testForwardHandler(t)
+
+	first, port, ok := handler.openForward(nil, srv, request(loopbackIPv4, 0))
+	if !ok {
+		t.Fatal("expected the first forward to be accepted")
+	}
+	key := forwardKey(loopbackIPv4, port)
+
+	if ok, _ := handler.cancelForward(request(loopbackIPv4, uint32(port))); !ok {
+		t.Fatal("expected the cancel to succeed")
+	}
+
+	second, reboundPort, ok := handler.openForward(nil, srv, request(loopbackIPv4, uint32(port)))
+	if !ok {
+		t.Fatal("expected a second forward on the same port to be accepted")
+	}
+	if reboundPort != port {
+		t.Fatalf("expected the same port, got %d and %d", port, reboundPort)
+	}
+	defer func() { _ = second.Close() }()
+
+	handler.acceptLoop(nil, first, loopbackIPv4, port, key)
+
+	if got := handler.listenerFor(loopbackIPv4, port); got != second {
+		t.Fatalf("the first accept loop evicted the replacement forward: forwards[%s] = %v", key, got)
+	}
+	if ok, _ := handler.cancelForward(request(loopbackIPv4, uint32(port))); !ok {
+		t.Error("expected the replacement forward to remain cancellable")
+	}
+}
+
 func TestForwardHandlerIgnoresUnknownCancel(t *testing.T) {
 	handler, _ := testForwardHandler(t)
 

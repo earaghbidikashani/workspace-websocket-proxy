@@ -170,6 +170,13 @@ func (h *loopbackForwardHandler) cancelForward(payload remoteForwardRequest) (bo
 }
 
 // acceptLoop relays each inbound connection to the client as its own channel.
+//
+// The entry is removed only when it still refers to this listener. By the time
+// this loop exits, closeForward has usually removed it already, since closing the
+// listener is what ends the loop. Deleting unconditionally would then evict a
+// forward that had claimed the same host and port in the meantime, and because
+// both the cancel request and connection teardown find a forward by key, nothing
+// would be able to close that listener afterwards.
 func (h *loopbackForwardHandler) acceptLoop(
 	conn *gossh.ServerConn,
 	listener net.Listener,
@@ -179,7 +186,9 @@ func (h *loopbackForwardHandler) acceptLoop(
 ) {
 	defer func() {
 		h.mu.Lock()
-		delete(h.forwards, key)
+		if h.forwards[key] == listener {
+			delete(h.forwards, key)
+		}
 		h.mu.Unlock()
 	}()
 

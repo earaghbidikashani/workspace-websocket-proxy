@@ -97,13 +97,13 @@ Endpoints: `/health` reports on the proxy process only and is safe for a pod rea
 | Variable | Default | Purpose |
 |---|---|---|
 | `SSH_LISTEN_ADDR` | `127.0.0.1:2222` | Bind address, must be loopback |
-| `SSH_HOST_KEY_PATH` | `$HOME/.jupyter-k8s/ssh_host_ed25519_key` | Persisted host key, generated on first use |
+| `SSH_HOST_KEY_PATH` | `$HOME/.ssh/ssh_host_ed25519_key` | Persisted host key, generated on first use |
 | `SSH_IDLE_TIMEOUT` | `12h` | Close a connection with no traffic in either direction. `0` disables. |
 | `SSH_MAX_SESSIONS` | `10` | Concurrent shell and exec cap, `0` disables |
 | `SSH_LOGIN_SHELL` | `false` | Run the session shell as a login shell |
 | `SSH_ALLOW_NON_LOOPBACK` | `false` | Permit a routable bind. Publishes an unauthenticated shell. |
 
-Persist the host key on storage that survives a container restart, otherwise every reconnect reports a changed host key. Enable `SSH_LOGIN_SHELL` for images that put their interpreter on `PATH` through a shell profile, such as conda-based images, rather than through the image environment.
+Persist the host key on storage that survives a container restart, otherwise every reconnect reports a changed host key. The server warns at startup when the key would not survive, which covers both temporary filesystems and the more common case of a key sitting on the container's own writable layer because no volume is mounted where it lives. The key is written to a temporary file, flushed and renamed into place, so a crash cannot leave a partial file that a later start would refuse. Enable `SSH_LOGIN_SHELL` for images that put their interpreter on `PATH` through a shell profile, such as conda-based images, rather than through the image environment.
 
 `SSH_MAX_SESSIONS` bounds shell and exec channels only. SFTP subsystems and port forwards do not claim a slot, so concurrent transfers and forwarded connections are unbounded, which is acceptable for a single-tenant workspace pod but worth knowing before relying on the number.
 

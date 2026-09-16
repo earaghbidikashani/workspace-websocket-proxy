@@ -246,25 +246,47 @@ func TestIsLoopback(t *testing.T) {
 	}
 }
 
-func TestHasEphemeralHostKeyPath(t *testing.T) {
-	tests := []struct {
-		path string
-		want bool
-	}{
-		{"/tmp/ssh_host_ed25519_key", true},
-		{"/var/tmp/ssh_host_ed25519_key", true},
-		{"/run/ssh_host_ed25519_key", true},
-		{"/dev/shm/ssh_host_ed25519_key", true},
-		{"/home/jovyan/.jupyter-k8s/ssh_host_ed25519_key", false},
-		{"/var/lib/keys/host_key", false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.path, func(t *testing.T) {
-			config := &Config{HostKeyPath: tc.path}
-			if got := config.hasEphemeralHostKeyPath(); got != tc.want {
-				t.Errorf("hasEphemeralHostKeyPath(%q) = %v, want %v", tc.path, got, tc.want)
+func TestHasEphemeralHostKeyPathFlagsTemporaryFilesystems(t *testing.T) {
+	for _, path := range []string{
+		"/tmp/ssh_host_ed25519_key",
+		"/var/tmp/ssh_host_ed25519_key",
+		"/run/ssh_host_ed25519_key",
+		"/dev/shm/ssh_host_ed25519_key",
+	} {
+		t.Run(path, func(t *testing.T) {
+			config := &Config{HostKeyPath: path}
+			if !config.hasEphemeralHostKeyPath() {
+				t.Errorf("expected %q to be reported as ephemeral", path)
 			}
 		})
+	}
+}
+
+// The case that actually occurs is a workspace with no volume, or a volume
+// mounted somewhere other than the key. The key lands on the container's writable
+// layer and the fingerprint rotates every restart, which the prefix list alone
+// never noticed.
+func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
+	config := &Config{HostKeyPath: "/var/lib/keys/host_key"}
+	if !config.hasEphemeralHostKeyPath() {
+		t.Error("expected a path on the root filesystem to be reported as ephemeral")
+	}
+}
+
+// A path that does not exist yet resolves through its nearest existing ancestor,
+// which is the first-start case: the directory is created after this runs.
+func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
+	config := &Config{HostKeyPath: "/var/lib/does-not-exist/nested/host_key"}
+	if !config.hasEphemeralHostKeyPath() {
+		t.Error("expected an unborn path under the root filesystem to be reported as ephemeral")
+	}
+}
+
+func TestIsOnRootDevice(t *testing.T) {
+	if !isOnRootDevice(rootPath) {
+		t.Error("expected the root directory to be on the root device")
+	}
+	if !isOnRootDevice("/definitely/not/present") {
+		t.Error("expected a missing path to resolve through its ancestors to the root device")
 	}
 }

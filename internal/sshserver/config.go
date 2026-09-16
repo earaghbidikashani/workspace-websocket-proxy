@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,15 +31,22 @@ const (
 
 	loopbackIPv4 = "127.0.0.1"
 
-	hostKeyDirName = ".jupyter-k8s"
+	// hostKeyDirName keeps the key where a person would look for an SSH key, and
+	// out of reach of a glob over the workspace's Jupyter dotfiles: cleanup
+	// scripts remove several of those, and a name adjacent to .jupyter would
+	// eventually be swept up by one, silently rotating the fingerprint.
+	hostKeyDirName = ".ssh"
 
 	hostKeyFileName = "ssh_host_ed25519_key"
 
 	localhostHost = "localhost"
+
+	rootPath = "/"
 )
 
-// ephemeralPathPrefixes are locations a container restart wipes, used to warn
-// when the host key would not survive a restart.
+// ephemeralPathPrefixes are locations a restart wipes even when they sit on their
+// own filesystem, which the root-device check cannot detect because a tmpfs mount
+// has a device of its own.
 var ephemeralPathPrefixes = []string{"/tmp/", "/var/tmp/", "/run/", "/dev/shm/"}
 
 // Config holds the SSH server configuration.
@@ -156,15 +164,57 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// hasEphemeralHostKeyPath reports whether the host key lives somewhere that a
-// container restart wipes, so the server can warn about it at startup.
+// hasEphemeralHostKeyPath reports whether the host key lives somewhere a restart
+// wipes, so the server can warn about it at startup.
+//
+// The common case is not a temporary directory but a workspace whose volume is
+// mounted somewhere other than the key's location, or has no volume at all. The
+// key then sits on the container's own writable layer and the fingerprint rotates
+// on every restart. Anything on the root filesystem is ephemeral by definition, so
+// comparing devices detects that directly, while the prefix list still covers
+// temporary filesystems, which have devices of their own.
 func (c *Config) hasEphemeralHostKeyPath() bool {
 	for _, prefix := range ephemeralPathPrefixes {
 		if strings.HasPrefix(c.HostKeyPath, prefix) {
 			return true
 		}
 	}
-	return false
+	return isOnRootDevice(filepath.Dir(c.HostKeyPath))
+}
+
+// isOnRootDevice reports whether path resides on the same filesystem as the root
+// directory. The nearest existing ancestor is used, because the key's directory is
+// created after this runs on a first start.
+func isOnRootDevice(path string) bool {
+	rootDevice, ok := deviceOf(rootPath)
+	if !ok {
+		return false
+	}
+
+	for {
+		if device, found := deviceOf(path); found {
+			return device == rootDevice
+		}
+
+		parent := filepath.Dir(path)
+		if parent == path {
+			return false
+		}
+		path = parent
+	}
+}
+
+func deviceOf(path string) (device uint64, ok bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(stat.Dev), true
 }
 
 // isLoopback reports whether host names only the loopback interface. An empty

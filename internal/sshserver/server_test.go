@@ -474,6 +474,93 @@ func TestLoadOrCreateHostKeyRejectsCorruptKey(t *testing.T) {
 	}
 }
 
+// Refusing to overwrite an unparseable key is deliberate, which makes a torn
+// write permanent: a truncated file would fail every later start with no way back.
+// The write therefore has to leave nothing behind but a complete key.
+func TestLoadOrCreateHostKeyLeavesNoPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host_key")
+
+	if _, _, err := loadOrCreateHostKey(path); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Errorf("expected only the host key to remain, found %v", names)
+	}
+
+	if _, _, err := loadOrCreateHostKey(path); err != nil {
+		t.Errorf("the written key must be loadable on a later start, got %v", err)
+	}
+}
+
+// A zero-byte key is what a torn write produces, and it is the shape that used to
+// be unrecoverable. It must still be refused rather than silently replaced, since
+// overwriting would rotate the identity of a server whose key may be intact on
+// another replica.
+func TestLoadOrCreateHostKeyRejectsEmptyKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "host_key")
+	if err := os.WriteFile(path, nil, hostKeyFileMode); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, _, err := loadOrCreateHostKey(path); err == nil {
+		t.Fatal("expected an empty host key to be refused")
+	}
+}
+
+// The temporary file has to share the target's directory, because rename is only
+// atomic within one filesystem.
+func TestWriteHostKeyAtomicallyUsesTheTargetDirectory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host_key")
+
+	if err := writeHostKeyAtomically(path, []byte("contents")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(contents) != "contents" {
+		t.Errorf("expected the contents to be written, got %q", contents)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := info.Mode().Perm(); got != hostKeyFileMode {
+		t.Errorf("expected mode %o, got %o", hostKeyFileMode, got)
+	}
+}
+
+func TestWriteHostKeyAtomicallyRemovesTheTempFileOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "subdir", "host_key")
+
+	if err := writeHostKeyAtomically(path, []byte("contents")); err == nil {
+		t.Fatal("expected a failure when the target directory does not exist")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected no leftover files, found %d", len(entries))
+	}
+}
+
 func TestBuildShellCommand(t *testing.T) {
 	tests := []struct {
 		name       string

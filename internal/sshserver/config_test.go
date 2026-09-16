@@ -262,10 +262,6 @@ func TestHasEphemeralHostKeyPathFlagsTemporaryFilesystems(t *testing.T) {
 	}
 }
 
-// The case that actually occurs is a workspace with no volume, or a volume
-// mounted somewhere other than the key. The key lands on the container's writable
-// layer and the fingerprint rotates every restart, which the prefix list alone
-// never noticed.
 func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
 	config := &Config{HostKeyPath: "/var/lib/keys/host_key"}
 	if !config.hasEphemeralHostKeyPath() {
@@ -273,8 +269,6 @@ func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
 	}
 }
 
-// A path that does not exist yet resolves through its nearest existing ancestor,
-// which is the first-start case: the directory is created after this runs.
 func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
 	config := &Config{HostKeyPath: "/var/lib/does-not-exist/nested/host_key"}
 	if !config.hasEphemeralHostKeyPath() {

@@ -32,9 +32,8 @@ const (
 	loopbackIPv4 = "127.0.0.1"
 
 	// hostKeyDirName keeps the key where a person would look for an SSH key, and
-	// out of reach of a glob over the workspace's Jupyter dotfiles: cleanup
-	// scripts remove several of those, and a name adjacent to .jupyter would
-	// eventually be swept up by one, silently rotating the fingerprint.
+	// clear of a glob over the workspace's Jupyter dotfiles, which cleanup scripts
+	// delete.
 	hostKeyDirName = ".ssh"
 
 	hostKeyFileName = "ssh_host_ed25519_key"
@@ -44,9 +43,8 @@ const (
 	rootPath = "/"
 )
 
-// ephemeralPathPrefixes are locations a restart wipes even when they sit on their
-// own filesystem, which the root-device check cannot detect because a tmpfs mount
-// has a device of its own.
+// ephemeralPathPrefixes are locations a restart wipes despite sitting on their
+// own filesystem, which the root-device check therefore misses.
 var ephemeralPathPrefixes = []string{"/tmp/", "/var/tmp/", "/run/", "/dev/shm/"}
 
 // Config holds the SSH server configuration.
@@ -165,14 +163,10 @@ func (c *Config) validate() error {
 }
 
 // hasEphemeralHostKeyPath reports whether the host key lives somewhere a restart
-// wipes, so the server can warn about it at startup.
-//
-// The common case is not a temporary directory but a workspace whose volume is
-// mounted somewhere other than the key's location, or has no volume at all. The
-// key then sits on the container's own writable layer and the fingerprint rotates
-// on every restart. Anything on the root filesystem is ephemeral by definition, so
-// comparing devices detects that directly, while the prefix list still covers
-// temporary filesystems, which have devices of their own.
+// wipes, so the server can warn at startup. The root filesystem is ephemeral by
+// definition, which catches a workspace whose volume is mounted elsewhere or
+// absent; the prefix list still covers temporary filesystems, which have devices
+// of their own.
 func (c *Config) hasEphemeralHostKeyPath() bool {
 	for _, prefix := range ephemeralPathPrefixes {
 		if strings.HasPrefix(c.HostKeyPath, prefix) {
@@ -182,9 +176,9 @@ func (c *Config) hasEphemeralHostKeyPath() bool {
 	return isOnRootDevice(filepath.Dir(c.HostKeyPath))
 }
 
-// isOnRootDevice reports whether path resides on the same filesystem as the root
-// directory. The nearest existing ancestor is used, because the key's directory is
-// created after this runs on a first start.
+// isOnRootDevice reports whether path shares a filesystem with the root
+// directory, resolving through the nearest existing ancestor because the key's
+// directory is created after this runs.
 func isOnRootDevice(path string) bool {
 	rootDevice, ok := deviceOf(rootPath)
 	if !ok {

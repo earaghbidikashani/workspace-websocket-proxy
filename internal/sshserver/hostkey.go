@@ -61,19 +61,11 @@ func loadOrCreateHostKey(path string) (signer ssh.Signer, generated bool, err er
 	return parsed, true, nil
 }
 
-// writeHostKeyAtomically installs the key so that path never holds a partial
-// file, because loadOrCreateHostKey refuses to overwrite a key it cannot parse.
-// A torn write would otherwise be permanent: every later start would fail on the
-// damaged file, and under a supervisor the program exhausts its retries and stays
-// down while the rest of the container looks healthy.
-//
-// The key is written to a temporary file beside it, flushed, and renamed into
-// place. Rename is atomic within a filesystem, which is why the temporary file
-// has to be in the same directory. Flushing first is what makes it survive a
-// crashed node rather than only a crashed process: the rename is journaled on its
-// own, so without the flush the rename can be durable while the contents are
-// still in the page cache, leaving an empty file at path. The directory is
-// flushed afterwards so the new entry itself is durable.
+// writeHostKeyAtomically installs the key so path never holds a partial file,
+// which loadOrCreateHostKey would refuse to parse and never repair. It writes a
+// temporary file in the same directory, since rename is only atomic within one
+// filesystem, and flushes before renaming so a crashed node cannot leave the
+// rename durable with the contents still in the page cache.
 func writeHostKeyAtomically(path string, contents []byte) error {
 	dir := filepath.Dir(path)
 
@@ -97,7 +89,7 @@ func writeHostKeyAtomically(path string, contents []byte) error {
 }
 
 // writeAndSync writes contents, restricts the mode and flushes to durable
-// storage, closing the file whatever happens.
+// storage, closing the file on every path.
 func writeAndSync(file *os.File, contents []byte) (err error) {
 	defer func() {
 		closeErr := file.Close()
@@ -115,9 +107,8 @@ func writeAndSync(file *os.File, contents []byte) (err error) {
 	return file.Sync()
 }
 
-// syncDir flushes a directory entry. A failure is not fatal: the key is written
-// and usable, it is only the durability of the new entry that is unconfirmed, and
-// some filesystems refuse the operation outright.
+// syncDir flushes a directory entry. Failure is not fatal: the key is already
+// written and usable, and some filesystems refuse the operation outright.
 func syncDir(dir string) error {
 	handle, err := os.Open(dir)
 	if err != nil {

@@ -474,9 +474,6 @@ func TestLoadOrCreateHostKeyRejectsCorruptKey(t *testing.T) {
 	}
 }
 
-// Refusing to overwrite an unparseable key is deliberate, which makes a torn
-// write permanent: a truncated file would fail every later start with no way back.
-// The write therefore has to leave nothing behind but a complete key.
 func TestLoadOrCreateHostKeyLeavesNoPartialFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "host_key")
@@ -502,10 +499,6 @@ func TestLoadOrCreateHostKeyLeavesNoPartialFile(t *testing.T) {
 	}
 }
 
-// A zero-byte key is what a torn write produces, and it is the shape that used to
-// be unrecoverable. It must still be refused rather than silently replaced, since
-// overwriting would rotate the identity of a server whose key may be intact on
-// another replica.
 func TestLoadOrCreateHostKeyRejectsEmptyKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "host_key")
 	if err := os.WriteFile(path, nil, hostKeyFileMode); err != nil {
@@ -517,8 +510,6 @@ func TestLoadOrCreateHostKeyRejectsEmptyKey(t *testing.T) {
 	}
 }
 
-// The temporary file has to share the target's directory, because rename is only
-// atomic within one filesystem.
 func TestWriteHostKeyAtomicallyUsesTheTargetDirectory(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "host_key")

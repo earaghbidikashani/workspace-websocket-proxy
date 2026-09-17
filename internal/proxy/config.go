@@ -12,6 +12,16 @@ import (
 	"time"
 )
 
+// defaultTargetHealthBannerPrefix is the SSH identification string prefix from
+// RFC 4253 section 4.2. The target is the remote access server, which sends it
+// in the clear before any key exchange, so the check needs no SSH library here
+// and the byte-copying data path stays protocol-agnostic.
+const defaultTargetHealthBannerPrefix = "SSH-2.0-"
+
+// defaultTargetHealthInterval is frequent enough for alerting to be timely and
+// infrequent enough that the connections are negligible to the target.
+const defaultTargetHealthInterval = 30 * time.Second
+
 // Config holds all configuration for the WebSocket proxy.
 type Config struct {
 	// ListenAddr is the address the HTTP server listens on.
@@ -34,7 +44,7 @@ type Config struct {
 	PingTimeout time.Duration
 
 	// MaxConnections is the maximum number of concurrent WebSocket connections.
-	// New connections are rejected with 503 when at capacity.
+	// New connections are rejected with 429 when at capacity.
 	MaxConnections int
 
 	// ReadLimit is the maximum size in bytes of incoming WebSocket messages.
@@ -45,6 +55,18 @@ type Config struct {
 
 	// RevalidationEndpoint is the URL to call for re-validation (future use).
 	RevalidationEndpoint string
+
+	// TargetHealthBannerPrefix is the greeting the target health probe expects the
+	// target to send on connect. A bare TCP dial succeeds off the listen backlog
+	// even when the target process is wedged and never calls accept, so the
+	// greeting is what proves the process is alive. Empty disables the check and
+	// reduces the probe to a dial.
+	TargetHealthBannerPrefix string
+
+	// TargetHealthInterval is how often the background prober checks the target.
+	// It bounds the load the check places on the target, since /health/target
+	// reports the last result rather than probing when asked.
+	TargetHealthInterval time.Duration
 }
 
 // LoadConfig reads configuration from environment variables with sensible defaults.
@@ -61,6 +83,11 @@ func LoadConfig() (*Config, error) {
 		ReadLimit:            int64(getIntEnv("READ_LIMIT", 65536)),
 		RevalidationInterval: getDurationEnv("REVALIDATION_INTERVAL", 5*time.Minute),
 		RevalidationEndpoint: getEnv("REVALIDATION_ENDPOINT", ""),
+
+		TargetHealthBannerPrefix: getEnvAllowEmpty(
+			"TARGET_HEALTH_BANNER_PREFIX", defaultTargetHealthBannerPrefix),
+		TargetHealthInterval: getDurationEnv(
+			"TARGET_HEALTH_INTERVAL", defaultTargetHealthInterval),
 	}
 
 	if config.TargetPort < 1 || config.TargetPort > 65535 {
@@ -78,6 +105,13 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("READ_LIMIT must be between 1024 and 10485760, got: %d", config.ReadLimit)
 	}
 
+	if config.TargetHealthInterval <= targetHealthDialTimeout {
+		return nil, fmt.Errorf(
+			"TARGET_HEALTH_INTERVAL (%s) must be greater than the probe timeout (%s)",
+			config.TargetHealthInterval, targetHealthDialTimeout,
+		)
+	}
+
 	return config, nil
 }
 
@@ -88,6 +122,15 @@ func (c *Config) TargetAddr() string {
 
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// getEnvAllowEmpty is getEnv for settings where an explicitly empty value is
+// meaningful rather than absent.
+func getEnvAllowEmpty(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
 		return value
 	}
 	return defaultValue

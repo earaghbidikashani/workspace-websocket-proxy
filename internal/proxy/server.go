@@ -6,15 +6,33 @@ Distributed under the terms of the MIT license
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/gorilla/websocket"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const (
+	healthPath              = "/health"
+	targetHealthPath        = "/health/target"
+	metricsPath             = "/metrics"
+	targetHealthDialTimeout = 2 * time.Second
+
+	// targetBannerReadLimit caps the greeting read. RFC 4253 section 4.2 limits
+	// the SSH identification string to 255 bytes including the trailing CRLF.
+	targetBannerReadLimit = 255
+
+	// capacityRetryAfterSeconds is the Retry-After hint sent with a 429.
+	capacityRetryAfterSeconds = "5"
 )
 
 // Server is the main WebSocket proxy HTTP server.
@@ -25,6 +43,14 @@ type Server struct {
 	revalidator    Revalidator
 	logger         logr.Logger
 	httpServer     *http.Server
+
+	// targetHealth is written by the background prober and read by
+	// handleTargetHealth.
+	targetHealth *targetHealth
+
+	proberStop chan struct{}
+	proberDone chan struct{}
+	proberOnce sync.Once
 }
 
 // NewServer creates a new proxy Server.
@@ -35,11 +61,13 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 		sessionManager: NewSessionManager(config.MaxConnections),
 		revalidator:    &NoOpRevalidator{},
 		logger:         logger.WithName("server"),
+		targetHealth:   &targetHealth{},
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.Handle("/metrics", promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc(healthPath, s.handleHealth)
+	mux.HandleFunc(targetHealthPath, s.handleTargetHealth)
+	mux.Handle(metricsPath, promhttp.HandlerFor(s.metrics.Registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/", s.handleWebSocket)
 
 	s.httpServer = &http.Server{
@@ -50,7 +78,7 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 	return s
 }
 
-// ListenAndServe starts the HTTP server.
+// ListenAndServe starts the target prober and the HTTP server.
 func (s *Server) ListenAndServe() error {
 	s.logger.Info("Starting WebSocket proxy",
 		"addr", s.config.ListenAddr,
@@ -59,12 +87,16 @@ func (s *Server) ListenAndServe() error {
 		"maxSessionDuration", s.config.MaxSessionDuration,
 		"pingInterval", s.config.PingInterval,
 		"pingTimeout", s.config.PingTimeout,
+		"targetHealthInterval", s.config.TargetHealthInterval,
 	)
+
+	s.startTargetProber()
 	return s.httpServer.ListenAndServe()
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server and the target prober.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopTargetProber()
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -73,6 +105,70 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, `{"status":"ok","activeConnections":%d}`, s.sessionManager.ActiveCount())
+}
+
+// handleTargetHealth reports the last probe result. It is for alerting, not
+// readiness: pod readiness gates every port on the pod, so a readiness probe that
+// failed because remote access was broken would also withdraw port 8888 and take
+// the web UI down with it.
+//
+// It reports rather than probes, so that the load this endpoint puts on the target
+// is fixed by the probe interval instead of by how often it is called. It shares
+// an unauthenticated listener with the data path.
+func (s *Server) handleTargetHealth(w http.ResponseWriter, _ *http.Request) {
+	target := s.config.TargetAddr()
+	result := s.targetHealth.snapshot()
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch {
+	case !result.checked:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"unknown","target":%q}`, target)
+	case result.reachable:
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"status":"ok","target":%q,"checkedAt":%q}`,
+			target, result.at.UTC().Format(time.RFC3339))
+	default:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"unreachable","target":%q,"checkedAt":%q,"error":%q}`,
+			target, result.at.UTC().Format(time.RFC3339), result.err)
+	}
+}
+
+// probeTarget connects to addr and, when bannerPrefix is set, reads the
+// greeting the target sends on connect and checks the prefix.
+//
+// The greeting is what makes this a liveness check rather than a port check: the
+// kernel completes the TCP handshake from the listen backlog even when the
+// target process is wedged and never calls accept, so a bare dial succeeds
+// against a deadlocked server. Nothing is written to the target, so the probe
+// cannot disturb it.
+func probeTarget(ctx context.Context, addr, bannerPrefix string) error {
+	conn, err := dialTCP(ctx, addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if bannerPrefix == "" {
+		return nil
+	}
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetReadDeadline(deadline); err != nil {
+			return fmt.Errorf("failed to set read deadline: %w", err)
+		}
+	}
+
+	banner, err := bufio.NewReader(io.LimitReader(conn, targetBannerReadLimit)).ReadString('\n')
+	if err != nil && banner == "" {
+		return fmt.Errorf("connected but read no greeting: %w", err)
+	}
+	if !strings.HasPrefix(banner, bannerPrefix) {
+		return fmt.Errorf("greeting %q does not start with %q", strings.TrimRight(banner, "\r\n"), bannerPrefix)
+	}
+	return nil
 }
 
 // upgrader configures the WebSocket upgrade.
@@ -95,7 +191,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			"active", s.sessionManager.ActiveCount(),
 			"max", s.config.MaxConnections)
 		s.metrics.ConnectionErrors.WithLabelValues("capacity_exceeded").Inc()
-		http.Error(w, "Service at capacity", http.StatusServiceUnavailable)
+		w.Header().Set("Retry-After", capacityRetryAfterSeconds)
+		http.Error(w, "Too many concurrent connections", http.StatusTooManyRequests)
 		return
 	}
 	defer s.sessionManager.Release()

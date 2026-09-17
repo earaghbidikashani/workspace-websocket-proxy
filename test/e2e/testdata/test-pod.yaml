@@ -17,6 +17,16 @@ spec:
           exec socat TCP-LISTEN:2222,fork,reuseaddr EXEC:cat
       ports:
         - containerPort: 2222
+      # The container installs socat before it listens, so without this the pod
+      # reports Ready while nothing is on 2222 and the first test races the
+      # install. The proxy's own probe cannot cover this: /health is deliberately
+      # unconditional so that a broken target never withdraws the web UI's port.
+      readinessProbe:
+        tcpSocket:
+          port: 2222
+        initialDelaySeconds: 1
+        periodSeconds: 2
+        failureThreshold: 30
 
     # WebSocket proxy sidecar
     - name: ws-proxy
@@ -36,6 +46,14 @@ spec:
           value: "30s"
         - name: MAX_CONNECTIONS
           value: "10"
+        # The fixture target is a socat echo server, not the remote access
+        # server, so it sends no SSH greeting for /health/target to check.
+        - name: TARGET_HEALTH_BANNER_PREFIX
+          value: ""
+        # The target installs socat before it listens, so probe often enough that
+        # the reported result converges quickly once it does.
+        - name: TARGET_HEALTH_INTERVAL
+          value: "5s"
       ports:
         - containerPort: 8080
       readinessProbe:

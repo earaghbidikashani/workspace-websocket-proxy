@@ -1,0 +1,516 @@
+/*
+Copyright (c) Amazon Web Services
+Distributed under the terms of the MIT license
+*/
+
+package sshserver_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/go-logr/zapr"
+	"github.com/gorilla/websocket"
+	"github.com/pkg/sftp"
+	"go.uber.org/zap"
+	gossh "golang.org/x/crypto/ssh"
+
+	"github.com/jupyter-infra/workspace-websocket-proxy/internal/proxy"
+	"github.com/jupyter-infra/workspace-websocket-proxy/internal/sshserver"
+)
+
+const (
+	startupTimeout = 5 * time.Second
+	dialTimeout    = 10 * time.Second
+)
+
+func testLogger() logr.Logger {
+	zapLog, _ := zap.NewDevelopment()
+	return zapr.NewLogger(zapLog)
+}
+
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to reserve a port: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+func waitForListener(t *testing.T, addr string) {
+	t.Helper()
+
+	deadline := time.Now().Add(startupTimeout)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("nothing listening on %s after %s", addr, startupTimeout)
+}
+
+func startSSHServer(t *testing.T) string {
+	t.Helper()
+
+	port := freeLoopbackPort(t)
+	config := &sshserver.Config{
+		ListenAddr:  fmt.Sprintf("127.0.0.1:%d", port),
+		HostKeyPath: filepath.Join(t.TempDir(), "host_key"),
+		MaxSessions: 5,
+	}
+
+	server, err := sshserver.New(config, testLogger())
+	if err != nil {
+		t.Fatalf("failed to create SSH server: %v", err)
+	}
+
+	go func() { _ = server.ListenAndServe() }()
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+
+	waitForListener(t, config.ListenAddr)
+	return config.ListenAddr
+}
+
+func startProxy(t *testing.T, target string) string {
+	t.Helper()
+
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		t.Fatalf("invalid target %q: %v", target, err)
+	}
+	targetPort, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		t.Fatalf("invalid target port %q: %v", portStr, err)
+	}
+
+	listenPort := freeLoopbackPort(t)
+	config := &proxy.Config{
+		ListenAddr:         fmt.Sprintf("127.0.0.1:%d", listenPort),
+		TargetHost:         host,
+		TargetPort:         targetPort,
+		MaxSessionDuration: time.Minute,
+		PingInterval:       time.Second,
+		PingTimeout:        2 * time.Second,
+		MaxConnections:     5,
+		ReadLimit:          65536,
+
+		// The target here is the real SSH server, so exercise the banner check
+		// rather than the bare dial.
+		TargetHealthBannerPrefix: "SSH-2.0-",
+		TargetHealthInterval:     100 * time.Millisecond,
+	}
+
+	server := proxy.NewServer(config, testLogger())
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+	}()
+	t.Cleanup(func() { _ = server.Shutdown(context.Background()) })
+
+	waitForListener(t, config.ListenAddr)
+	return config.ListenAddr
+}
+
+type wsConn struct {
+	ws      *websocket.Conn
+	pending io.Reader
+}
+
+func (c *wsConn) Read(p []byte) (int, error) {
+	for {
+		if c.pending != nil {
+			n, err := c.pending.Read(p)
+			if errors.Is(err, io.EOF) {
+				c.pending = nil
+				if n > 0 {
+					return n, nil
+				}
+				continue
+			}
+			return n, err
+		}
+
+		messageType, reader, err := c.ws.NextReader()
+		if err != nil {
+			return 0, err
+		}
+		if messageType != websocket.BinaryMessage {
+			continue
+		}
+		c.pending = reader
+	}
+}
+
+func (c *wsConn) Write(p []byte) (int, error) {
+	if err := c.ws.WriteMessage(websocket.BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *wsConn) Close() error                      { return c.ws.Close() }
+func (c *wsConn) LocalAddr() net.Addr               { return c.ws.LocalAddr() }
+func (c *wsConn) RemoteAddr() net.Addr              { return c.ws.RemoteAddr() }
+func (c *wsConn) SetReadDeadline(t time.Time) error { return c.ws.SetReadDeadline(t) }
+func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	return c.ws.SetWriteDeadline(t)
+}
+
+func (c *wsConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func dialSSHThroughProxy(t *testing.T, proxyAddr string) *gossh.Client {
+	t.Helper()
+
+	dialer := websocket.Dialer{HandshakeTimeout: dialTimeout}
+	ws, _, err := dialer.Dial(fmt.Sprintf("ws://%s/", proxyAddr), nil)
+	if err != nil {
+		t.Fatalf("failed to dial the proxy: %v", err)
+	}
+
+	transport := &wsConn{ws: ws}
+	clientConfig := &gossh.ClientConfig{
+		User:            "workspace",
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         dialTimeout,
+	}
+
+	conn, chans, reqs, err := gossh.NewClientConn(transport, "workspace", clientConfig)
+	if err != nil {
+		_ = transport.Close()
+		t.Fatalf("failed to establish the SSH connection: %v", err)
+	}
+
+	client := gossh.NewClient(conn, chans, reqs)
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func newSessionStack(t *testing.T) *gossh.Client {
+	t.Helper()
+	return dialSSHThroughProxy(t, startProxy(t, startSSHServer(t)))
+}
+
+func TestSSHOverWebSocketRunsCommand(t *testing.T) {
+	client := newSessionStack(t)
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open a session: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	output, err := session.Output("echo integration-ok")
+	if err != nil {
+		t.Fatalf("failed to run the command: %v", err)
+	}
+
+	if got := string(output); got != "integration-ok\n" {
+		t.Errorf("expected %q, got %q", "integration-ok\n", got)
+	}
+}
+
+func TestSSHOverWebSocketPropagatesExitCode(t *testing.T) {
+	client := newSessionStack(t)
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open a session: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	err = session.Run("exit 33")
+
+	var exitErr *gossh.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected an *ssh.ExitError, got %v", err)
+	}
+	if exitErr.ExitStatus() != 33 {
+		t.Errorf("expected exit status 33, got %d", exitErr.ExitStatus())
+	}
+}
+
+func TestSSHOverWebSocketPassesSessionEnvironment(t *testing.T) {
+	client := newSessionStack(t)
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open a session: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := session.Setenv("INTEGRATION_KEY", "integration-value"); err != nil {
+		t.Skipf("server declined the environment request: %v", err)
+	}
+
+	output, err := session.Output("printf %s \"$INTEGRATION_KEY\"")
+	if err != nil {
+		t.Fatalf("failed to run the command: %v", err)
+	}
+
+	if got := string(output); got != "integration-value" {
+		t.Errorf("expected %q, got %q", "integration-value", got)
+	}
+}
+
+func TestSSHOverWebSocketAllocatesPty(t *testing.T) {
+	client := newSessionStack(t)
+
+	session, err := client.NewSession()
+	if err != nil {
+		t.Fatalf("failed to open a session: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	modes := gossh.TerminalModes{gossh.ECHO: 0}
+	if err := session.RequestPty("xterm", 24, 80, modes); err != nil {
+		t.Fatalf("failed to request a pty: %v", err)
+	}
+
+	output, err := session.Output("tty")
+	if err != nil {
+		t.Fatalf("failed to run the command: %v", err)
+	}
+
+	if len(output) == 0 {
+		t.Error("expected tty to report a terminal device")
+	}
+}
+
+func TestSFTPOverWebSocketRoundTrip(t *testing.T) {
+	client := newSessionStack(t)
+
+	sftpClient, err := sftp.NewClient(client)
+	if err != nil {
+		t.Fatalf("failed to open an SFTP client: %v", err)
+	}
+	defer func() { _ = sftpClient.Close() }()
+
+	path := filepath.Join(t.TempDir(), "payload.txt")
+	want := []byte("sftp round trip")
+
+	remoteFile, err := sftpClient.Create(path)
+	if err != nil {
+		t.Fatalf("failed to create the remote file: %v", err)
+	}
+	if _, err := remoteFile.Write(want); err != nil {
+		t.Fatalf("failed to write the remote file: %v", err)
+	}
+	if err := remoteFile.Close(); err != nil {
+		t.Fatalf("failed to close the remote file: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read the file back: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("expected %q, got %q", want, got)
+	}
+}
+
+func TestLocalPortForwardReachesLoopbackService(t *testing.T) {
+	backend := newEchoBackend(t)
+	client := newSessionStack(t)
+
+	conn, err := client.Dial("tcp", backend)
+	if err != nil {
+		t.Fatalf("failed to open a forwarded connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte("forwarded")); err != nil {
+		t.Fatalf("failed to write to the forwarded connection: %v", err)
+	}
+
+	echoed, err := readFullWithin(conn, len("forwarded"), dialTimeout)
+	if err != nil {
+		t.Fatalf("failed to read from the forwarded connection: %v", err)
+	}
+
+	if string(echoed) != "forwarded" {
+		t.Errorf("expected %q, got %q", "forwarded", echoed)
+	}
+}
+
+func readFullWithin(reader io.Reader, n int, timeout time.Duration) ([]byte, error) {
+	type result struct {
+		buf []byte
+		err error
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		buf := make([]byte, n)
+		_, err := io.ReadFull(reader, buf)
+		done <- result{buf: buf, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		return r.buf, r.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("read of %d bytes did not complete within %s", n, timeout)
+	}
+}
+
+// A reverse forward must land on loopback even when the client asks for every
+// interface, which is exactly what IDEs do. Unrewritten, the library would hand
+// the wildcard to net.Listen and publish the listener on every pod interface.
+func TestReverseForwardBindsLoopbackOnly(t *testing.T) {
+	client := newSessionStack(t)
+
+	listener, err := client.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatalf("failed to request a reverse forward: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	_, portStr, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("unexpected forward address %q: %v", listener.Addr(), err)
+	}
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	// The forward has to work on loopback.
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", portStr), dialTimeout)
+	if err != nil {
+		t.Fatalf("expected the reverse forward to be reachable on loopback: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.Write([]byte("reversed")); err != nil {
+		t.Fatalf("failed to write through the reverse forward: %v", err)
+	}
+	echoed, err := readFullWithin(conn, len("reversed"), dialTimeout)
+	if err != nil {
+		t.Fatalf("failed to read back through the reverse forward: %v", err)
+	}
+	if string(echoed) != "reversed" {
+		t.Errorf("expected %q, got %q", "reversed", echoed)
+	}
+
+	// And it must not be anywhere else. Binding the same port on a routable
+	// address only succeeds if the server did not take the wildcard.
+	routable := routableIPv4(t)
+	probe, err := net.Listen("tcp", net.JoinHostPort(routable, portStr))
+	if err != nil {
+		t.Fatalf("port %s is occupied on %s, so the reverse forward bound more than "+
+			"loopback: %v", portStr, routable, err)
+	}
+	_ = probe.Close()
+}
+
+// routableIPv4 returns a non-loopback IPv4 address of this host, which is what
+// makes it possible to tell a loopback bind from a wildcard one.
+func routableIPv4(t *testing.T) string {
+	t.Helper()
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skipf("cannot enumerate interface addresses: %v", err)
+	}
+
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok || ipNet.IP.IsLoopback() {
+			continue
+		}
+		if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+			return ipv4.String()
+		}
+	}
+
+	t.Skip("this host has no non-loopback IPv4 address to distinguish the bind")
+	return ""
+}
+
+func TestLocalPortForwardRejectsNonLoopbackDestination(t *testing.T) {
+	client := newSessionStack(t)
+
+	if conn, err := client.Dial("tcp", "10.0.0.5:80"); err == nil {
+		_ = conn.Close()
+		t.Error("expected a forward to a routable address to be refused")
+	}
+}
+
+func TestProxyTargetHealthReflectsSSHServer(t *testing.T) {
+	proxyAddr := startProxy(t, startSSHServer(t))
+
+	url := fmt.Sprintf("http://%s/health/target", proxyAddr)
+
+	deadline := time.Now().Add(startupTimeout)
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatalf("failed to request target health: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			return
+		}
+		if !strings.Contains(string(body), "unknown") {
+			t.Fatalf("expected the probe to reach the SSH server, got %d (%s)", resp.StatusCode, body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	t.Fatalf("the background prober never reported the SSH server reachable")
+}
+
+func newEchoBackend(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start the echo backend: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
+}

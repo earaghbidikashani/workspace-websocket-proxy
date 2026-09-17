@@ -1,0 +1,286 @@
+/*
+Copyright (c) Amazon Web Services
+Distributed under the terms of the MIT license
+*/
+
+package sshserver
+
+import (
+	"os/user"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestLoadConfigDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	config := LoadConfig()
+
+	if want := "127.0.0.1:2222"; config.ListenAddr != want {
+		t.Errorf("expected %s, got %s", want, config.ListenAddr)
+	}
+	if want := filepath.Join(home, hostKeyDirName, hostKeyFileName); config.HostKeyPath != want {
+		t.Errorf("expected %s, got %s", want, config.HostKeyPath)
+	}
+	if config.IdleTimeout != defaultIdleTimeout {
+		t.Errorf("expected %s, got %s", defaultIdleTimeout, config.IdleTimeout)
+	}
+	if config.MaxSessions != defaultMaxSessions {
+		t.Errorf("expected %d, got %d", defaultMaxSessions, config.MaxSessions)
+	}
+	if config.LoginShell {
+		t.Error("expected LoginShell to default to false")
+	}
+	if config.AllowNonLoopback {
+		t.Error("expected AllowNonLoopback to default to false")
+	}
+}
+
+func TestLoadConfigFromEnv(t *testing.T) {
+	t.Setenv("SSH_LISTEN_ADDR", "127.0.0.1:2020")
+	t.Setenv("SSH_HOST_KEY_PATH", "/var/lib/keys/host_key")
+	t.Setenv("SSH_IDLE_TIMEOUT", "30m")
+	t.Setenv("SSH_MAX_SESSIONS", "3")
+	t.Setenv("SSH_LOGIN_SHELL", "true")
+	t.Setenv("SSH_ALLOW_NON_LOOPBACK", "true")
+
+	config := LoadConfig()
+
+	if want := "127.0.0.1:2020"; config.ListenAddr != want {
+		t.Errorf("expected %s, got %s", want, config.ListenAddr)
+	}
+	if want := "/var/lib/keys/host_key"; config.HostKeyPath != want {
+		t.Errorf("expected %s, got %s", want, config.HostKeyPath)
+	}
+	if want := 30 * time.Minute; config.IdleTimeout != want {
+		t.Errorf("expected %s, got %s", want, config.IdleTimeout)
+	}
+	if config.MaxSessions != 3 {
+		t.Errorf("expected 3, got %d", config.MaxSessions)
+	}
+	if !config.LoginShell {
+		t.Error("expected LoginShell to be true")
+	}
+	if !config.AllowNonLoopback {
+		t.Error("expected AllowNonLoopback to be true")
+	}
+}
+
+func TestLoadConfigIgnoresUnparseableValues(t *testing.T) {
+	t.Setenv("SSH_IDLE_TIMEOUT", "not-a-duration")
+	t.Setenv("SSH_MAX_SESSIONS", "not-a-number")
+	t.Setenv("SSH_LOGIN_SHELL", "not-a-bool")
+
+	config := LoadConfig()
+
+	if config.IdleTimeout != defaultIdleTimeout {
+		t.Errorf("expected fallback %s, got %s", defaultIdleTimeout, config.IdleTimeout)
+	}
+	if config.MaxSessions != defaultMaxSessions {
+		t.Errorf("expected fallback %d, got %d", defaultMaxSessions, config.MaxSessions)
+	}
+	if config.LoginShell {
+		t.Error("expected fallback false")
+	}
+}
+
+func TestDefaultHostKeyPathPrefersHomeEnv(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	want := filepath.Join(home, hostKeyDirName, hostKeyFileName)
+	if got := defaultHostKeyPath(); got != want {
+		t.Errorf("expected %s, got %s", want, got)
+	}
+}
+
+func TestDefaultHostKeyPathFallsBackToPasswdEntry(t *testing.T) {
+	t.Setenv("HOME", "")
+
+	current, err := user.Current()
+	if err != nil || current.HomeDir == "" {
+		t.Skip("no passwd home directory available")
+	}
+
+	want := filepath.Join(current.HomeDir, hostKeyDirName, hostKeyFileName)
+	if got := defaultHostKeyPath(); got != want {
+		t.Errorf("expected fallback to the passwd home %s, got %s", want, got)
+	}
+}
+
+func validConfig() *Config {
+	return &Config{
+		ListenAddr:  "127.0.0.1:2222",
+		HostKeyPath: "/var/lib/keys/host_key",
+		MaxSessions: 10,
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{
+			name:   "loopback ipv4",
+			mutate: func(c *Config) { c.ListenAddr = "127.0.0.1:2222" },
+		},
+		{
+			name:   "loopback ipv6",
+			mutate: func(c *Config) { c.ListenAddr = "[::1]:2222" },
+		},
+		{
+			name:   localhostHost,
+			mutate: func(c *Config) { c.ListenAddr = localhostHost + ":2222" },
+		},
+		{
+			name:    "wildcard bind rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "0.0.0.0:2222" },
+			wantErr: true,
+		},
+		{
+			name:    "empty host rejected",
+			mutate:  func(c *Config) { c.ListenAddr = ":2222" },
+			wantErr: true,
+		},
+		{
+			name:    "routable address rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "10.0.0.5:2222" },
+			wantErr: true,
+		},
+		{
+			name: "routable address allowed with explicit override",
+			mutate: func(c *Config) {
+				c.ListenAddr = "0.0.0.0:2222"
+				c.AllowNonLoopback = true
+			},
+		},
+		{
+			name:    "malformed address rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "127.0.0.1" },
+			wantErr: true,
+		},
+		{
+			name:    "port zero rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "127.0.0.1:0" },
+			wantErr: true,
+		},
+		{
+			name:    "port above range rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "127.0.0.1:70000" },
+			wantErr: true,
+		},
+		{
+			name:    "non-numeric port rejected",
+			mutate:  func(c *Config) { c.ListenAddr = "127.0.0.1:ssh" },
+			wantErr: true,
+		},
+		{
+			name:    "empty host key path rejected",
+			mutate:  func(c *Config) { c.HostKeyPath = "" },
+			wantErr: true,
+		},
+		{
+			name:    "relative host key path rejected",
+			mutate:  func(c *Config) { c.HostKeyPath = "keys/host_key" },
+			wantErr: true,
+		},
+		{
+			name:    "negative max sessions rejected",
+			mutate:  func(c *Config) { c.MaxSessions = -1 },
+			wantErr: true,
+		},
+		{
+			name:   "zero max sessions allowed",
+			mutate: func(c *Config) { c.MaxSessions = 0 },
+		},
+		{
+			name:    "negative idle timeout rejected",
+			mutate:  func(c *Config) { c.IdleTimeout = -time.Second },
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			config := validConfig()
+			tc.mutate(config)
+
+			err := config.validate()
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestIsLoopback(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"127.0.0.1", true},
+		{"127.0.0.53", true},
+		{"::1", true},
+		{localhostHost, true},
+		{"", false},
+		{"*", false},
+		{"0.0.0.0", false},
+		{"10.0.0.5", false},
+		{"::", false},
+		{"example.com", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			if got := isLoopback(tc.host); got != tc.want {
+				t.Errorf("isLoopback(%q) = %v, want %v", tc.host, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHasEphemeralHostKeyPathFlagsTemporaryFilesystems(t *testing.T) {
+	for _, path := range []string{
+		"/tmp/ssh_host_ed25519_key",
+		"/var/tmp/ssh_host_ed25519_key",
+		"/run/ssh_host_ed25519_key",
+		"/dev/shm/ssh_host_ed25519_key",
+	} {
+		t.Run(path, func(t *testing.T) {
+			config := &Config{HostKeyPath: path}
+			if !config.hasEphemeralHostKeyPath() {
+				t.Errorf("expected %q to be reported as ephemeral", path)
+			}
+		})
+	}
+}
+
+func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
+	config := &Config{HostKeyPath: "/var/lib/keys/host_key"}
+	if !config.hasEphemeralHostKeyPath() {
+		t.Error("expected a path on the root filesystem to be reported as ephemeral")
+	}
+}
+
+func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
+	config := &Config{HostKeyPath: "/var/lib/does-not-exist/nested/host_key"}
+	if !config.hasEphemeralHostKeyPath() {
+		t.Error("expected an unborn path under the root filesystem to be reported as ephemeral")
+	}
+}
+
+func TestIsOnRootDevice(t *testing.T) {
+	if !isOnRootDevice(rootPath) {
+		t.Error("expected the root directory to be on the root device")
+	}
+	if !isOnRootDevice("/definitely/not/present") {
+		t.Error("expected a missing path to resolve through its ancestors to the root device")
+	}
+}

@@ -34,6 +34,46 @@ func TestConfigDefaults(t *testing.T) {
 	if config.ReadLimit != 65536 {
 		t.Errorf("expected 65536, got %d", config.ReadLimit)
 	}
+	if config.TargetHealthBannerPrefix != "SSH-2.0-" {
+		t.Errorf("expected SSH-2.0-, got %q", config.TargetHealthBannerPrefix)
+	}
+	if config.TargetHealthInterval != defaultTargetHealthInterval {
+		t.Errorf("expected %s, got %s", defaultTargetHealthInterval, config.TargetHealthInterval)
+	}
+}
+
+func TestConfigRejectsTargetHealthIntervalBelowProbeTimeout(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_INTERVAL", "1s")
+
+	if _, err := LoadConfig(); err == nil {
+		t.Error("expected an interval shorter than the probe timeout to be rejected")
+	}
+}
+
+func TestConfigAcceptsTargetHealthInterval(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_INTERVAL", "5m")
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := 5 * time.Minute; config.TargetHealthInterval != want {
+		t.Errorf("expected %s, got %s", want, config.TargetHealthInterval)
+	}
+}
+
+// An explicitly empty value must disable the banner check rather than fall back
+// to the default, which is how a non-SSH target opts out.
+func TestConfigBannerPrefixHonoursExplicitEmpty(t *testing.T) {
+	t.Setenv("TARGET_HEALTH_BANNER_PREFIX", "")
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if config.TargetHealthBannerPrefix != "" {
+		t.Errorf("expected the banner check to be disabled, got %q", config.TargetHealthBannerPrefix)
+	}
 }
 
 func TestConfigTargetAddr(t *testing.T) {

@@ -10,6 +10,7 @@ package e2e
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"os/exec"
 	"time"
@@ -81,7 +82,7 @@ var _ = Describe("WebSocket Proxy", func() {
 				Fail("expected connection to be rejected at capacity")
 			}
 			if resp != nil {
-				Expect(resp.StatusCode).To(Equal(503))
+				Expect(resp.StatusCode).To(Equal(http.StatusTooManyRequests))
 			}
 		})
 
@@ -90,6 +91,21 @@ var _ = Describe("WebSocket Proxy", func() {
 				"--", "/ws-proxy", "--healthcheck")
 			output, err := cmd.CombinedOutput()
 			Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("health check failed: %s", output))
+		})
+
+		It("should report the target reachable on /health/target", func() {
+			portForwardCmd := exec.Command("kubectl", "port-forward", "pod/ws-proxy-e2e", "18082:8080")
+			err := portForwardCmd.Start()
+			Expect(err).NotTo(HaveOccurred())
+			defer portForwardCmd.Process.Kill()
+
+			time.Sleep(2 * time.Second)
+
+			resp, err := http.Get("http://127.0.0.1:18082/health/target")
+			Expect(err).NotTo(HaveOccurred())
+			defer resp.Body.Close()
+
+			Expect(resp.StatusCode).To(Equal(http.StatusOK))
 		})
 	})
 })

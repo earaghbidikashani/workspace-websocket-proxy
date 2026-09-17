@@ -14,6 +14,7 @@ env:
   STAGING_REGISTRY: ghcr.io/jupyter-infra/staging
   PROD_REGISTRY: ghcr.io/jupyter-infra
   IMAGE_NAME: workspace-websocket-proxy
+  SSH_IMAGE_NAME: remote-access-server
 
 jobs:
   promote:
@@ -34,13 +35,18 @@ jobs:
         uses: imjasonh/setup-crane@v0.4
 
       - name: Copy from staging to production
+        env:
+          VERSION: ${{ inputs.version }}
+          SHORT_SHA: ${{ inputs.short_sha }}
         run: |
-          crane copy \
-            ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }} \
-            ${{ env.PROD_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}
-          crane copy \
-            ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ inputs.short_sha }} \
-            ${{ env.PROD_REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ inputs.short_sha }}
-          crane copy \
-            ${{ env.STAGING_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }} \
-            ${{ env.PROD_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          for image in "${{ env.IMAGE_NAME }}" "${{ env.SSH_IMAGE_NAME }}"; do
+            crane copy \
+              "${{ env.STAGING_REGISTRY }}/$image:$VERSION" \
+              "${{ env.PROD_REGISTRY }}/$image:$VERSION"
+            crane copy \
+              "${{ env.STAGING_REGISTRY }}/$image:sha-$SHORT_SHA" \
+              "${{ env.PROD_REGISTRY }}/$image:sha-$SHORT_SHA"
+            crane copy \
+              "${{ env.STAGING_REGISTRY }}/$image:$VERSION" \
+              "${{ env.PROD_REGISTRY }}/$image:latest"
+          done

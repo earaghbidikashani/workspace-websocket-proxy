@@ -1,0 +1,10 @@
+# The image builds bind mount the whole context, so everything here forms the
+# cache key for the Go compile. bin/ matters most: it is tens of megabytes that
+# `make build` rewrites immediately before both image builds in CI, which would
+# otherwise invalidate the compile on every run.
+bin/
+.git/
+.github/
+coverage.*
+*.out
+*.md

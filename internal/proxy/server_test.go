@@ -269,6 +269,48 @@ func TestStopTargetProberIsSafeWithoutStart(t *testing.T) {
 	NewServer(testConfig(), testLogger()).stopTargetProber()
 }
 
+func TestListenAndServeThenShutdownOnAnotherGoroutine(t *testing.T) {
+	config := testConfig()
+	config.ListenAddr = "127.0.0.1:0"
+
+	server := NewServer(config, testLogger())
+
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = server.ListenAndServe()
+	}()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		t.Errorf("expected a clean shutdown, got %v", err)
+	}
+}
+
+func TestShutdownBeforeListenAndServeStillStopsTheProber(t *testing.T) {
+	config := testConfig()
+	config.ListenAddr = "127.0.0.1:0"
+
+	server := NewServer(config, testLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	server.startTargetProber()
+
+	server.proberMu.Lock()
+	defer server.proberMu.Unlock()
+	if server.proberDone != nil {
+		t.Error("expected starting after shutdown to be a no-op")
+	}
+}
+
 func TestTargetProberToleratesNonPositiveInterval(t *testing.T) {
 	config := testConfig()
 	config.TargetHealthInterval = 0

@@ -6,6 +6,7 @@ Distributed under the terms of the MIT license
 package sshserver
 
 import (
+	"os"
 	"os/user"
 	"path/filepath"
 	"testing"
@@ -263,17 +264,48 @@ func TestHasEphemeralHostKeyPathFlagsTemporaryFilesystems(t *testing.T) {
 }
 
 func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
-	config := &Config{HostKeyPath: "/var/lib/keys/host_key"}
+	config := &Config{HostKeyPath: "/host_key"}
 	if !config.hasEphemeralHostKeyPath() {
 		t.Error("expected a path on the root filesystem to be reported as ephemeral")
 	}
 }
 
 func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
-	config := &Config{HostKeyPath: "/var/lib/does-not-exist/nested/host_key"}
+	config := &Config{HostKeyPath: "/does-not-exist/nested/host_key"}
 	if !config.hasEphemeralHostKeyPath() {
 		t.Error("expected an unborn path under the root filesystem to be reported as ephemeral")
 	}
+}
+
+func TestHasEphemeralHostKeyPathAcceptsANonRootFilesystem(t *testing.T) {
+	dir := findNonRootDirectory(t)
+
+	config := &Config{HostKeyPath: filepath.Join(dir, "host_key")}
+	if config.hasEphemeralHostKeyPath() {
+		t.Errorf("expected %q, which is not on the root filesystem, to be reported as durable", dir)
+	}
+}
+
+func findNonRootDirectory(t *testing.T) string {
+	t.Helper()
+
+	rootInfo, err := os.Stat(rootPath)
+	if err != nil {
+		t.Skipf("cannot stat %s: %v", rootPath, err)
+	}
+
+	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private"} {
+		info, statErr := os.Stat(candidate)
+		if statErr != nil {
+			continue
+		}
+		if !onSameDevice(info, rootInfo) {
+			return candidate
+		}
+	}
+
+	t.Skip("this host mounts nothing outside the root filesystem")
+	return ""
 }
 
 func TestIsOnRootDevice(t *testing.T) {

@@ -44,13 +44,14 @@ type Server struct {
 	logger         logr.Logger
 	httpServer     *http.Server
 
-	// targetHealth is written by the background prober and read by
-	// handleTargetHealth.
 	targetHealth *targetHealth
 
-	proberStop chan struct{}
-	proberDone chan struct{}
-	proberOnce sync.Once
+	proberCtx    context.Context
+	proberCancel context.CancelFunc
+
+	proberMu      sync.Mutex
+	proberDone    chan struct{}
+	proberStopped bool
 }
 
 // NewServer creates a new proxy Server.
@@ -63,6 +64,7 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 		logger:         logger.WithName("server"),
 		targetHealth:   &targetHealth{},
 	}
+	s.proberCtx, s.proberCancel = context.WithCancel(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthPath, s.handleHealth)
@@ -129,7 +131,8 @@ func (s *Server) handleTargetHealth(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = fmt.Fprintf(w, `{"status":"ok","target":%q,"checkedAt":%q}`,
 			target, result.at.UTC().Format(time.RFC3339))
-	default:
+	default: // before traffic reaches this handler. The proxy performs no auth itself.
+
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = fmt.Fprintf(w, `{"status":"unreachable","target":%q,"checkedAt":%q,"error":%q}`,
 			target, result.at.UTC().Format(time.RFC3339), result.err)
@@ -181,7 +184,6 @@ var upgrader = websocket.Upgrader{
 
 // handleWebSocket upgrades the HTTP connection and starts a proxied session.
 // Precondition: authentication is handled externally by Traefik ForwardAuth
-// before traffic reaches this handler. The proxy performs no auth itself.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	logger := s.logger.WithValues("remoteAddr", r.RemoteAddr)
 

@@ -46,6 +46,14 @@ jobs:
             crane copy \
               "${{ env.STAGING_REGISTRY }}/$image:sha-$SHORT_SHA" \
               "${{ env.PROD_REGISTRY }}/$image:sha-$SHORT_SHA"
+          done
+
+      - name: Point latest at the release
+        if: ${{ !contains(inputs.version, '-') }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          for image in "${{ env.IMAGE_NAME }}" "${{ env.SSH_IMAGE_NAME }}"; do
             crane copy \
               "${{ env.STAGING_REGISTRY }}/$image:$VERSION" \
               "${{ env.PROD_REGISTRY }}/$image:latest"

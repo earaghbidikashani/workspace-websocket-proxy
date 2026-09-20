@@ -16,9 +16,6 @@ const (
 	remoteAccessPackage = "github.com/jupyter-infra/workspace-websocket-proxy/cmd/remote-access-server"
 )
 
-// sshOnlyDependencies belong to the remote access server. The sidecar image must
-// not carry them: a CVE in any of them would otherwise be reported against the
-// sidecar, which cannot reach the code.
 var sshOnlyDependencies = []string{
 	"github.com/jupyter-infra/workspace-websocket-proxy/internal/sshserver",
 	"github.com/gliderlabs/ssh",
@@ -26,10 +23,6 @@ var sshOnlyDependencies = []string{
 	"github.com/pkg/sftp",
 }
 
-// The separation between the two binaries is otherwise enforced only by prose in
-// AGENT.md, so an import that pulled the SSH server into the sidecar would
-// compile and pass every other check while quietly restoring the dependencies
-// the two-image split removed.
 func TestSidecarDoesNotDependOnTheSSHServer(t *testing.T) {
 	deps := transitiveDeps(t, sidecarPackage)
 
@@ -43,8 +36,6 @@ func TestSidecarDoesNotDependOnTheSSHServer(t *testing.T) {
 	}
 }
 
-// The companion assertion: if the remote access server ever stopped depending on
-// these, the test above would be passing for the wrong reason.
 func TestRemoteAccessServerDependsOnTheSSHServer(t *testing.T) {
 	deps := transitiveDeps(t, remoteAccessPackage)
 
@@ -63,8 +54,6 @@ func TestRemoteAccessServerDependsOnTheSSHServer(t *testing.T) {
 	}
 }
 
-// transitiveDeps lists everything a package imports, directly or indirectly, so
-// an import reached through internal/proxy is caught as well as a direct one.
 func transitiveDeps(t *testing.T, pkg string) []string {
 	t.Helper()
 

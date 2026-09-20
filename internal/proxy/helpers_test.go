@@ -40,7 +40,6 @@ var (
 	connectionCounts   = map[string]int{}
 )
 
-// startCountingTCPServer starts a TCP server that counts accepted connections.
 func startCountingTCPServer(t *testing.T) (string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -73,8 +72,6 @@ func connectionCount(addr string) int {
 	return connectionCounts[addr]
 }
 
-// startBannerTCPServer starts a TCP server that writes banner on connect and
-// then echoes, standing in for the remote access server's SSH greeting.
 func startBannerTCPServer(t *testing.T, banner string) (string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -110,10 +107,6 @@ func startBannerTCPServer(t *testing.T, banner string) (string, func()) {
 	return listener.Addr().String(), func() { _ = listener.Close() }
 }
 
-// startWedgedTCPServer starts a listener that never calls Accept, reproducing a
-// target process that is deadlocked. The kernel still completes the TCP
-// handshake from the listen backlog, so a dial succeeds and only a read
-// detects it.
 func startWedgedTCPServer(t *testing.T) (string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -123,7 +116,6 @@ func startWedgedTCPServer(t *testing.T) (string, func()) {
 	return listener.Addr().String(), func() { _ = listener.Close() }
 }
 
-// startEchoTCPServer starts a TCP server that echoes received data back.
 func startEchoTCPServer(t *testing.T) (string, func()) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

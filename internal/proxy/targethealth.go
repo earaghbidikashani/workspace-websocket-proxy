@@ -71,13 +71,7 @@ func (s *Server) probeOnce(ctx context.Context) {
 	s.metrics.TargetReachable.Set(1)
 }
 
-// startTargetProber begins probing the target on a fixed interval.
-//
-// The interval, rather than an incoming request, is what makes the metric
-// meaningful: a gauge written only by a handler stays at its zero value on a
-// healthy pod, because nothing calls the endpoint. It also decouples the load on
-// the target from the request rate, so the target sees one connection per
-// interval however often the endpoint is asked, and by whoever.
+// startTargetProber begins probing the target on a fixed interval. No-op after Shutdown.
 func (s *Server) startTargetProber() {
 	interval := s.config.TargetHealthInterval
 	if interval <= 0 {

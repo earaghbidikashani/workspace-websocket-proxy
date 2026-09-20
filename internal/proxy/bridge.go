@@ -17,7 +17,6 @@ import (
 
 const (
 	// writeWait is the time allowed to write a message to the peer.
-	// This also bounds how long the write mutex can be held.
 	writeWait = 10 * time.Second
 
 	// tcpReadBufferSize is the size of the buffer used when reading from the TCP connection.
@@ -27,8 +26,7 @@ const (
 
 // Bridge handles bidirectional data copy between a WebSocket connection and a TCP connection.
 // It enforces gorilla/websocket's concurrency rules: at most one concurrent reader
-// and one concurrent writer. The writeMu serializes all write operations (data frames
-// and control frames like ping).
+// and one concurrent writer.
 type Bridge struct {
 	ws      *websocket.Conn
 	tcp     net.Conn
@@ -52,20 +50,16 @@ func NewBridge(ws *websocket.Conn, tcp net.Conn, metrics *Metrics, logger logr.L
 func (b *Bridge) Run() error {
 	errChan := make(chan error, 2)
 
-	// WebSocket → TCP (read pump)
 	go func() {
 		errChan <- b.copyWSToTCP()
 	}()
 
-	// TCP → WebSocket (write pump)
 	go func() {
 		errChan <- b.copyTCPToWS()
 	}()
 
-	// Wait for first error or completion
 	err := <-errChan
 
-	// Close both connections to unblock the other goroutine
 	b.ws.Close()
 	b.tcp.Close()
 
@@ -83,8 +77,6 @@ func (b *Bridge) WriteMessage(messageType int, data []byte) error {
 }
 
 // WriteControl writes a WebSocket control frame (ping, close) with proper deadline.
-// gorilla/websocket documents that WriteControl can be called concurrently with
-// all other methods, but we still serialize through writeMu for safety.
 func (b *Bridge) WriteControl(messageType int, data []byte, deadline time.Time) error {
 	b.writeMu.Lock()
 	defer b.writeMu.Unlock()

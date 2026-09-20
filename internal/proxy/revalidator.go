@@ -7,13 +7,8 @@ package proxy
 
 import "context"
 
-// Revalidator defines the interface for periodic session re-validation.
-// This is scaffolding for future implementation. When implemented, the proxy
-// will periodically call the auth middleware to verify the user still has
-// access to the workspace.
+// Revalidator periodically re-validates a session. Scaffolding, not yet implemented.
 type Revalidator interface {
-	// Revalidate checks whether the session is still authorized.
-	// Returns nil if the session is valid, or an error if it should be terminated.
 	Revalidate(ctx context.Context) error
 }
 

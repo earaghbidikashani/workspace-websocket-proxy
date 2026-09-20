@@ -13,9 +13,7 @@ import (
 )
 
 // defaultTargetHealthBannerPrefix is the SSH identification string prefix from
-// RFC 4253 section 4.2. The target is the remote access server, which sends it
-// in the clear before any key exchange, so the check needs no SSH library here
-// and the byte-copying data path stays protocol-agnostic.
+// RFC 4253 section 4.2 and the target is the remote access server
 const defaultTargetHealthBannerPrefix = "SSH-2.0-"
 
 // defaultTargetHealthInterval is frequent enough for alerting to be timely and
@@ -56,16 +54,10 @@ type Config struct {
 	// RevalidationEndpoint is the URL to call for re-validation (future use).
 	RevalidationEndpoint string
 
-	// TargetHealthBannerPrefix is the greeting the target health probe expects the
-	// target to send on connect. A bare TCP dial succeeds off the listen backlog
-	// even when the target process is wedged and never calls accept, so the
-	// greeting is what proves the process is alive. Empty disables the check and
-	// reduces the probe to a dial.
+	// TargetHealthBannerPrefix is the greeting the probe expects on connect, empty to disable.
 	TargetHealthBannerPrefix string
 
 	// TargetHealthInterval is how often the background prober checks the target.
-	// It bounds the load the check places on the target, since /health/target
-	// reports the last result rather than probing when asked.
 	TargetHealthInterval time.Duration
 }
 

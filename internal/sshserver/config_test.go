@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -294,9 +295,12 @@ func findNonRootDirectory(t *testing.T) string {
 		t.Skipf("cannot stat %s: %v", rootPath, err)
 	}
 
-	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private", "/run", "/tmp", "/dev/shm"} {
+	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private"} {
 		info, statErr := os.Stat(candidate)
 		if statErr != nil {
+			continue
+		}
+		if hasEphemeralPrefix(candidate) {
 			continue
 		}
 		if !onSameDevice(info, rootInfo) {
@@ -304,8 +308,20 @@ func findNonRootDirectory(t *testing.T) string {
 		}
 	}
 
-	t.Skip("this host mounts nothing outside the root filesystem")
+	t.Skip("this host mounts nothing durable outside the root filesystem")
 	return ""
+}
+
+// hasEphemeralPrefix keeps the search away from temporary filesystems, which
+// hasEphemeralHostKeyPath rejects by prefix before it ever compares devices, so
+// a path under one can never satisfy a durable expectation.
+func hasEphemeralPrefix(dir string) bool {
+	for _, prefix := range ephemeralPathPrefixes {
+		if strings.HasPrefix(dir+"/", prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIsOnRootDevice(t *testing.T) {

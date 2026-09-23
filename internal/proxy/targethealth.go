@@ -7,6 +7,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -61,6 +62,11 @@ func (s *Server) probeOnce(ctx context.Context) {
 	target := s.config.TargetAddr()
 
 	err := probeTarget(ctx, target, s.config.TargetHealthBannerPrefix)
+
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+
 	s.targetHealth.record(err == nil, err)
 
 	if err != nil {

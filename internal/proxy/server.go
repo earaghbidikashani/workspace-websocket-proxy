@@ -138,6 +138,8 @@ func probeTarget(ctx context.Context, addr, bannerPrefix string) error {
 		return nil
 	}
 
+	defer context.AfterFunc(ctx, func() { _ = conn.Close() })()
+
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
 			return fmt.Errorf("failed to set read deadline: %w", err)

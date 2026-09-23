@@ -52,6 +52,52 @@ func TestMaxSessionDuration(t *testing.T) {
 	}
 }
 
+func TestSessionTeardownDoesNotStallAfterClientDisconnect(t *testing.T) {
+	tcpAddr, cleanupTCP := startEchoTCPServer(t)
+	defer cleanupTCP()
+
+	_, portStr, _ := net.SplitHostPort(tcpAddr)
+	port, _ := strconv.Atoi(portStr)
+
+	config := testConfig()
+	config.TargetHost = "127.0.0.1"
+	config.TargetPort = port
+	config.PingInterval = 10 * time.Second
+	config.PingTimeout = 20 * time.Second
+
+	server := NewServer(config, testLogger())
+	ts := httptest.NewServer(server.httpServer.Handler)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForActiveCount(t, server, 1)
+
+	if err := ws.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	waitForActiveCount(t, server, 0)
+}
+
+func waitForActiveCount(t *testing.T, server *Server, want int32) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if server.sessionManager.ActiveCount() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for %d active sessions, saw %d", want, server.sessionManager.ActiveCount())
+}
+
 func TestSessionManager(t *testing.T) {
 	sm := NewSessionManager(3)
 

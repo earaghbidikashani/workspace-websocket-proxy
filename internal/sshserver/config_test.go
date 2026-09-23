@@ -280,9 +280,9 @@ func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
 func TestHasEphemeralHostKeyPathAcceptsANonRootFilesystem(t *testing.T) {
 	dir := findNonRootDirectory(t)
 
-	config := &Config{HostKeyPath: filepath.Join(dir, "host_key")}
+	config := &Config{HostKeyPath: filepath.Join(dir, "does-not-exist/nested/host_key")}
 	if config.hasEphemeralHostKeyPath() {
-		t.Errorf("expected %q, which is not on the root filesystem, to be reported as durable", dir)
+		t.Errorf("expected an unborn path under %q, which is not on the root filesystem, to be reported as durable", dir)
 	}
 }
 
@@ -294,7 +294,7 @@ func findNonRootDirectory(t *testing.T) string {
 		t.Skipf("cannot stat %s: %v", rootPath, err)
 	}
 
-	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private"} {
+	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private", "/run", "/tmp", "/dev/shm"} {
 		info, statErr := os.Stat(candidate)
 		if statErr != nil {
 			continue

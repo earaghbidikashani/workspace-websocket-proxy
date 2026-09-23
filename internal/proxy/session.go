@@ -114,6 +114,8 @@ func (s *Session) Run(ctx context.Context) error {
 	pingDone := make(chan struct{})
 	go s.pingLoop(ctx, bridge, pingDone)
 
+	// Cancel the context first to unblock pingLoop, then wait for it to exit.
+	// Two defers would run LIFO — wait first, then cancel — and never return.
 	defer func() {
 		s.cancel()
 		<-pingDone

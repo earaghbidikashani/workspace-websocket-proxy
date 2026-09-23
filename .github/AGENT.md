@@ -38,28 +38,13 @@ workflow_dispatch (version + dry_run)
 
 `dry_run` stages without promoting, giving a manual verification checkpoint.
 
-The carrier image is consumed by a workspace image in
-[jupyter-deploy](https://github.com/jupyter-infra/jupyter-deploy) via `COPY --from`,
-so a promoted version is what downstream builds pin. Promote deliberately, and
-prefer an explicit version over `:latest` in any consuming Dockerfile.
-
-## Build Caching
-
-The image builds pin the builder stage to `$BUILDPLATFORM` and cross-compile, rather
-than running the Go toolchain under QEMU for the non-native architecture. On an
-arm64 host, emulating amd64 took 1m34s for one platform; cross-compiling builds both
-in 14s.
-
-`cache-from` / `cache-to: type=gha` is set on both image builds. It carries layers
-only, not `RUN --mount=type=cache` contents
-([moby/buildkit#1512](https://github.com/moby/buildkit/issues/1512)), so the module
-and build caches start empty on a fresh runner regardless. The layer cache is still
-worth having; there is nothing further to tune there.
-
-`.dockerignore` matters more than it looks. The builds bind mount the whole context,
-so everything in it forms the cache key for the Go compile. `bin/` alone is around
-25 MB that `make build` rewrites immediately before both image builds, which
-invalidated the compile on every run until it was excluded.
+The carrier image exists for a workspace image to consume via `COPY --from`. Nothing
+does yet: wiring it into
+[jupyter-deploy](https://github.com/jupyter-infra/jupyter-deploy) is
+[#6](https://github.com/jupyter-infra/workspace-websocket-proxy/issues/6) task 4.
+Once it lands, a promoted version is what downstream builds pin, so promote
+deliberately and prefer an explicit version over `:latest` in any consuming
+Dockerfile.
 
 ## Testing Workflow Changes
 

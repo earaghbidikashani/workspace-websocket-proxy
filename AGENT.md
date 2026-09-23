@@ -221,10 +221,9 @@ README.md for the tables.
 - `make test-e2e-full`
 
 Anything touching concurrency or platform-specific syscalls should also be checked
-on Linux, not only on a developer Mac. Two defects reached CI that way: an
-`unconvert` finding on `syscall.Stat_t.Dev`, which is `uint64` on Linux and `int32`
-on Darwin, and a `WaitGroup.Add` versus `Wait` race that only the Linux race
-detector reported.
+on Linux, not only on a developer Mac. That is how an `unconvert` finding on
+`syscall.Stat_t.Dev` reached CI: it is `uint64` on Linux and `int32` on Darwin, so
+the conversion Darwin needs is redundant on Linux.
 
 ## CI & Release
 

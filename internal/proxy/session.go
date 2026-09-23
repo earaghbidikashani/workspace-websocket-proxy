@@ -15,8 +15,6 @@ import (
 )
 
 const (
-	// closeGracePeriod is the time to wait after sending a close frame
-	// before force-closing the connection.
 	closeGracePeriod = 5 * time.Second
 )
 
@@ -94,21 +92,15 @@ func (s *Session) Run(ctx context.Context) error {
 		s.metrics.ConnectionDuration.Observe(duration)
 	}()
 
-	// Configure pong handler: reset read deadline on each pong received.
-	// This follows the gorilla/websocket recommended pattern from examples/chat.
 	s.ws.SetPongHandler(func(string) error {
 		return s.ws.SetReadDeadline(time.Now().Add(s.config.PingTimeout))
 	})
-
-	// Limit incoming message size to prevent memory exhaustion.
 	s.ws.SetReadLimit(s.config.ReadLimit)
 
-	// Set initial read deadline — if no pong arrives within PingTimeout, reads will fail.
 	if err := s.ws.SetReadDeadline(time.Now().Add(s.config.PingTimeout)); err != nil {
 		return err
 	}
 
-	// Dial the TCP target
 	tcp, err := dialTCP(ctx, s.config.TargetAddr())
 	if err != nil {
 		s.logger.Error(err, "Failed to dial TCP target", "addr", s.config.TargetAddr())
@@ -118,17 +110,12 @@ func (s *Session) Run(ctx context.Context) error {
 	defer tcp.Close()
 
 	s.logger.Info("Session established", "target", s.config.TargetAddr())
-
-	// Create bridge (holds the write mutex for safe concurrent writes)
 	bridge := NewBridge(s.ws, tcp, s.metrics, s.logger)
-
-	// Start ping ticker — uses bridge.WriteControl for thread-safe writes.
-	// Ping period must be less than pong timeout (gorilla best practice).
 	pingDone := make(chan struct{})
 	go s.pingLoop(ctx, bridge, pingDone)
-	// Cancel context first (unblocks pingLoop), then wait for it to exit.
-	// Defer runs LIFO: wait-for-ping runs, then cancel runs — wrong order.
-	// So we cancel explicitly before waiting.
+
+	// Cancel the context first to unblock pingLoop, then wait for it to exit.
+	// Two defers would run LIFO — wait first, then cancel — and never return.
 	defer func() {
 		s.cancel()
 		<-pingDone
@@ -139,25 +126,21 @@ func (s *Session) Run(ctx context.Context) error {
 	// every s.config.RevalidationInterval. If it returns an error, call s.cancel()
 	// to terminate the session (user access revoked).
 
-	// Start max duration timer
 	maxDurationTimer := time.AfterFunc(s.config.MaxSessionDuration, func() {
 		s.logger.Info("Max session duration reached, closing connection",
 			"duration", s.config.MaxSessionDuration)
 		s.metrics.ConnectionErrors.WithLabelValues("max_duration").Inc()
-		// Send close frame then cancel context after grace period
 		_ = bridge.WriteControl(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "session duration limit reached"),
 			time.Now().Add(writeWait),
 		)
-		// Give the peer time to process the close frame
 		time.AfterFunc(closeGracePeriod, func() {
 			s.cancel()
 		})
 	})
 	defer maxDurationTimer.Stop()
 
-	// Run bridge in a goroutine so we can select on context cancellation
 	bridgeErr := make(chan error, 1)
 	go func() {
 		bridgeErr <- bridge.Run()
@@ -167,7 +150,6 @@ func (s *Session) Run(ctx context.Context) error {
 	case err := <-bridgeErr:
 		return err
 	case <-ctx.Done():
-		// Context cancelled (max duration or external termination)
 		_ = s.ws.Close()
 		_ = tcp.Close()
 		return ctx.Err()

@@ -6,8 +6,10 @@ Distributed under the terms of the MIT license
 package sshserver
 
 import (
+	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -263,17 +265,63 @@ func TestHasEphemeralHostKeyPathFlagsTemporaryFilesystems(t *testing.T) {
 }
 
 func TestHasEphemeralHostKeyPathFlagsTheRootFilesystem(t *testing.T) {
-	config := &Config{HostKeyPath: "/var/lib/keys/host_key"}
+	config := &Config{HostKeyPath: "/host_key"}
 	if !config.hasEphemeralHostKeyPath() {
 		t.Error("expected a path on the root filesystem to be reported as ephemeral")
 	}
 }
 
 func TestHasEphemeralHostKeyPathResolvesMissingDirectories(t *testing.T) {
-	config := &Config{HostKeyPath: "/var/lib/does-not-exist/nested/host_key"}
+	config := &Config{HostKeyPath: "/does-not-exist/nested/host_key"}
 	if !config.hasEphemeralHostKeyPath() {
 		t.Error("expected an unborn path under the root filesystem to be reported as ephemeral")
 	}
+}
+
+func TestHasEphemeralHostKeyPathAcceptsANonRootFilesystem(t *testing.T) {
+	dir := findNonRootDirectory(t)
+
+	config := &Config{HostKeyPath: filepath.Join(dir, "does-not-exist/nested/host_key")}
+	if config.hasEphemeralHostKeyPath() {
+		t.Errorf("expected an unborn path under %q, which is not on the root filesystem, to be reported as durable", dir)
+	}
+}
+
+func findNonRootDirectory(t *testing.T) string {
+	t.Helper()
+
+	rootInfo, err := os.Stat(rootPath)
+	if err != nil {
+		t.Skipf("cannot stat %s: %v", rootPath, err)
+	}
+
+	for _, candidate := range []string{"/home", "/Users", "/Volumes", "/data", "/mnt", "/var", "/private"} {
+		info, statErr := os.Stat(candidate)
+		if statErr != nil {
+			continue
+		}
+		if hasEphemeralPrefix(candidate) {
+			continue
+		}
+		if !onSameDevice(info, rootInfo) {
+			return candidate
+		}
+	}
+
+	t.Skip("this host mounts nothing durable outside the root filesystem")
+	return ""
+}
+
+// hasEphemeralPrefix keeps the search away from temporary filesystems, which
+// hasEphemeralHostKeyPath rejects by prefix before it ever compares devices, so
+// a path under one can never satisfy a durable expectation.
+func hasEphemeralPrefix(dir string) bool {
+	for _, prefix := range ephemeralPathPrefixes {
+		if strings.HasPrefix(dir+"/", prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestIsOnRootDevice(t *testing.T) {

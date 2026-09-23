@@ -265,8 +265,107 @@ func TestTargetProberStopsOnShutdown(t *testing.T) {
 	}
 }
 
+func TestProbeOnceDoesNotRecordACancelledProbe(t *testing.T) {
+	addr, cleanup := startWedgedTCPServer(t)
+	defer cleanup()
+
+	server := newServerForTarget(t, addr, "SSH-2.0-")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	server.probeOnce(ctx)
+
+	if server.targetHealth.snapshot().checked {
+		t.Error("expected a cancelled probe to leave the reported state untouched")
+	}
+}
+
+func TestProbeOnceRecordsADeadlineAsUnreachable(t *testing.T) {
+	addr, cleanup := startWedgedTCPServer(t)
+	defer cleanup()
+
+	server := newServerForTarget(t, addr, "SSH-2.0-")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	server.probeOnce(ctx)
+
+	result := server.targetHealth.snapshot()
+	if !result.checked {
+		t.Fatal("expected a timed-out probe to be recorded")
+	}
+	if result.reachable {
+		t.Error("expected a timed-out probe to be recorded as unreachable")
+	}
+}
+
+func TestProbeTargetStopsReadingWhenTheContextIsCancelled(t *testing.T) {
+	addr, cleanup := startWedgedTCPServer(t)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	start := time.Now()
+	err := probeTarget(ctx, addr, "SSH-2.0-")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("expected a cancelled probe to fail")
+	}
+	if elapsed > time.Second {
+		t.Errorf("probe took %s, expected the cancel to end the read rather than the deadline", elapsed)
+	}
+}
+
 func TestStopTargetProberIsSafeWithoutStart(t *testing.T) {
 	NewServer(testConfig(), testLogger()).stopTargetProber()
+}
+
+func TestListenAndServeThenShutdownOnAnotherGoroutine(t *testing.T) {
+	config := testConfig()
+	config.ListenAddr = "127.0.0.1:0"
+
+	server := NewServer(config, testLogger())
+
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = server.ListenAndServe()
+	}()
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		t.Errorf("expected a clean shutdown, got %v", err)
+	}
+}
+
+func TestShutdownBeforeListenAndServeStillStopsTheProber(t *testing.T) {
+	config := testConfig()
+	config.ListenAddr = "127.0.0.1:0"
+
+	server := NewServer(config, testLogger())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	server.startTargetProber()
+
+	server.proberMu.Lock()
+	defer server.proberMu.Unlock()
+	if server.proberDone != nil {
+		t.Error("expected starting after shutdown to be a no-op")
+	}
 }
 
 func TestTargetProberToleratesNonPositiveInterval(t *testing.T) {

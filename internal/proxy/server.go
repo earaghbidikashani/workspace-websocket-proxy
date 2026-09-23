@@ -22,16 +22,11 @@ import (
 )
 
 const (
-	healthPath              = "/health"
-	targetHealthPath        = "/health/target"
-	metricsPath             = "/metrics"
-	targetHealthDialTimeout = 2 * time.Second
-
-	// targetBannerReadLimit caps the greeting read. RFC 4253 section 4.2 limits
-	// the SSH identification string to 255 bytes including the trailing CRLF.
-	targetBannerReadLimit = 255
-
-	// capacityRetryAfterSeconds is the Retry-After hint sent with a 429.
+	healthPath                = "/health"
+	targetHealthPath          = "/health/target"
+	metricsPath               = "/metrics"
+	targetHealthDialTimeout   = 2 * time.Second
+	targetBannerReadLimit     = 255
 	capacityRetryAfterSeconds = "5"
 )
 
@@ -44,13 +39,14 @@ type Server struct {
 	logger         logr.Logger
 	httpServer     *http.Server
 
-	// targetHealth is written by the background prober and read by
-	// handleTargetHealth.
 	targetHealth *targetHealth
 
-	proberStop chan struct{}
-	proberDone chan struct{}
-	proberOnce sync.Once
+	proberCtx    context.Context
+	proberCancel context.CancelFunc
+
+	proberMu      sync.Mutex
+	proberDone    chan struct{}
+	proberStopped bool
 }
 
 // NewServer creates a new proxy Server.
@@ -63,6 +59,7 @@ func NewServer(config *Config, logger logr.Logger) *Server {
 		logger:         logger.WithName("server"),
 		targetHealth:   &targetHealth{},
 	}
+	s.proberCtx, s.proberCancel = context.WithCancel(context.Background())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthPath, s.handleHealth)
@@ -107,14 +104,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":"ok","activeConnections":%d}`, s.sessionManager.ActiveCount())
 }
 
-// handleTargetHealth reports the last probe result. It is for alerting, not
-// readiness: pod readiness gates every port on the pod, so a readiness probe that
-// failed because remote access was broken would also withdraw port 8888 and take
-// the web UI down with it.
-//
-// It reports rather than probes, so that the load this endpoint puts on the target
-// is fixed by the probe interval instead of by how often it is called. It shares
-// an unauthenticated listener with the data path.
+// handleTargetHealth reports the last probe result. For alerting, not readiness.
 func (s *Server) handleTargetHealth(w http.ResponseWriter, _ *http.Request) {
 	target := s.config.TargetAddr()
 	result := s.targetHealth.snapshot()
@@ -136,14 +126,7 @@ func (s *Server) handleTargetHealth(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
-// probeTarget connects to addr and, when bannerPrefix is set, reads the
-// greeting the target sends on connect and checks the prefix.
-//
-// The greeting is what makes this a liveness check rather than a port check: the
-// kernel completes the TCP handshake from the listen backlog even when the
-// target process is wedged and never calls accept, so a bare dial succeeds
-// against a deadlocked server. Nothing is written to the target, so the probe
-// cannot disturb it.
+// probeTarget dials addr and, when bannerPrefix is set, checks the greeting.
 func probeTarget(ctx context.Context, addr, bannerPrefix string) error {
 	conn, err := dialTCP(ctx, addr)
 	if err != nil {
@@ -154,6 +137,8 @@ func probeTarget(ctx context.Context, addr, bannerPrefix string) error {
 	if bannerPrefix == "" {
 		return nil
 	}
+
+	defer context.AfterFunc(ctx, func() { _ = conn.Close() })()
 
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := conn.SetReadDeadline(deadline); err != nil {
@@ -181,11 +166,9 @@ var upgrader = websocket.Upgrader{
 
 // handleWebSocket upgrades the HTTP connection and starts a proxied session.
 // Precondition: authentication is handled externally by Traefik ForwardAuth
-// before traffic reaches this handler. The proxy performs no auth itself.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	logger := s.logger.WithValues("remoteAddr", r.RemoteAddr)
 
-	// Enforce concurrency limit
 	if !s.sessionManager.Acquire() {
 		logger.Info("Connection rejected: at capacity",
 			"active", s.sessionManager.ActiveCount(),
@@ -197,7 +180,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.sessionManager.Release()
 
-	// Upgrade to WebSocket
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error(err, "WebSocket upgrade failed")
@@ -212,7 +194,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("WebSocket connection established")
 
-	// Create and run session
 	session := NewSession(ws, s.config, s.metrics, logger, s.revalidator)
 	if err := session.Run(r.Context()); err != nil {
 		if err != context.Canceled {

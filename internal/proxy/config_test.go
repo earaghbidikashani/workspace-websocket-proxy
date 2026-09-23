@@ -62,8 +62,6 @@ func TestConfigAcceptsTargetHealthInterval(t *testing.T) {
 	}
 }
 
-// An explicitly empty value must disable the banner check rather than fall back
-// to the default, which is how a non-SSH target opts out.
 func TestConfigBannerPrefixHonoursExplicitEmpty(t *testing.T) {
 	t.Setenv("TARGET_HEALTH_BANNER_PREFIX", "")
 
